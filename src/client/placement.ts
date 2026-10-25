@@ -1,43 +1,48 @@
-/**
- * Placement gating for the Context view: the per-user `defaultPlacement`
- * preference (the settings namespace's `defaultPlacement` field) picks which
- * registrations carry it — the conversation tab, the right Sidebar panel, or
- * both.
- *
- * Each mount is a factory returning its own disposer, so a preference flip
- * takes down only what the new value drops and mounts only what it adds; the
- * underlying `slots.inject` / deferred-inject disposers are the harness's own
- * dynamic-mount idiom. A mount landing no disposer (a harness face that
- * returns nothing) simply has nothing to unwind.
- *
- * @module dsh-context/client/placement
- */
-
 import type { ContextSettings } from './settings'
 import type { DefaultPlacement } from '../shared/types'
 
-/** One registration factory per placement; each returns its mount's disposer. */
 export interface PlacementMounts {
   tab(): unknown
   sidebar(): unknown
 }
 
-/**
- * Mount per the current preference and keep the registrations glued to it
- * until the returned disposer runs.
- */
+/** The surfaces a placement mounts; a positive membership set, so 'hide' mounts neither. */
+export function placementSurfaces(placement: DefaultPlacement): { tab: boolean; sidebar: boolean } {
+  return {
+    tab: placement === 'all' || placement === 'tab',
+    sidebar: placement === 'all' || placement === 'sidebar',
+  }
+}
+
 export function watchPlacement(settings: ContextSettings, mounts: PlacementMounts): () => void {
   let tab: (() => void) | undefined
   let sidebar: (() => void) | undefined
-  const own = (result: unknown): (() => void) | undefined =>
-    typeof result === 'function' ? result as () => void : undefined
+  // A mount is tracked by its OWN state, not the disposer it hands back: a face registering without
+  // one must still count as mounted, or a later publish would register the seats twice.
+  let tabMounted = false
+  let sidebarMounted = false
   const mount = (placement: DefaultPlacement): void => {
-    const wantTab = placement !== 'sidebar'
-    const wantSidebar = placement !== 'tab'
-    if (wantTab && tab === undefined) tab = own(mounts.tab())
-    if (!wantTab && tab !== undefined) { tab(); tab = undefined }
-    if (wantSidebar && sidebar === undefined) sidebar = own(mounts.sidebar())
-    if (!wantSidebar && sidebar !== undefined) { sidebar(); sidebar = undefined }
+    const { tab: wantTab, sidebar: wantSidebar } = placementSurfaces(placement)
+    if (wantTab && !tabMounted) {
+      const result: unknown = mounts.tab()
+      tab = typeof result === 'function' ? result as () => void : undefined
+      tabMounted = true
+    }
+    if (!wantTab && tabMounted) {
+      tab?.()
+      tab = undefined
+      tabMounted = false
+    }
+    if (wantSidebar && !sidebarMounted) {
+      const result: unknown = mounts.sidebar()
+      sidebar = typeof result === 'function' ? result as () => void : undefined
+      sidebarMounted = true
+    }
+    if (!wantSidebar && sidebarMounted) {
+      sidebar?.()
+      sidebar = undefined
+      sidebarMounted = false
+    }
   }
   mount(settings.defaultPlacement())
   const unsubscribe = settings.store.subscribe(() => { mount(settings.defaultPlacement()) })
@@ -47,5 +52,7 @@ export function watchPlacement(settings: ContextSettings, mounts: PlacementMount
     sidebar?.()
     tab = undefined
     sidebar = undefined
+    tabMounted = false
+    sidebarMounted = false
   }
 }

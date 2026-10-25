@@ -1,115 +1,91 @@
-/**
- * The on-demand DETAIL route of the split `contextTimeline` generation.
- *
- * The projection's wire value is the slim head (fold.ts `buildTimelineHead`);
- * the heavy collections (per-request records, context events, the served
- * surface window, the removed-node archive) are served HERE instead — one
- * targeted read per viewing client, only while its Context tab or /context
- * modal is open, instead of riding every session.list row, control baseline,
- * follow snapshot, and push frame whole (see shared/types.ts
- * `ContextTimelineDetail`).
- *
- * The transport is Connection's exact Fetch-route registry
- * (`ctx.connection.fetch.register`) — the same seam the harness's own file
- * upload and media-reference routes mount through, riding the authenticated
- * `/api` fence. The handler resolves the session through the harness's own
- * ladder: a LIVE session's unit state comes straight off the registry's
- * `stateOf` (no second fold); a session only ever VIEWED cold (prepared into
- * the observation cache — `SessionStore.prepare` never enters it into the
- * live store) is observed through `ctx.sessionQuery` and its immutable log
- * folded from init (cheap: a cold session's log is static, and the client's
- * per-session store reads it once per page view). A session that left the
- * live set mid-request, a unit that never registered, or a session nothing
- * can observe resolves to a typed `null` — the client keeps its last detail
- * and offers a retry, never an unhandled rejection.
- *
- * Load order is never assumed: `watchDetailChannel` nests a `ctx.inject` on
- * the two faces the registration reads (connection, sessions), so a service
- * that activates AFTER this plugin still arms the route (cordis replays the
- * inject when the dependency set completes). The returned gate is read by
- * the timeline unit's view at every serve, so the wire generation flips to
- * slim the moment the route goes live and flips back if it unloads — the
- * client reconciles both (it detects the generation per value,
- * timelineSource.ts). A deployment whose connection/sessions services never
- * compose — or whose connection carries no fetch registry — keeps the gate
- * closed forever and serves the inline value unchanged.
- */
+/** The on-demand detail route of the split `contextTimeline` generation: one targeted read per viewing client serves
+ * the heavy collections the slim head omits — a live session's state off the registry's `stateOf` (no second fold), a
+ * cold one's immutable log folded from init, anything else a typed `null`. */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { FoldBounds } from './config'
-import { applyTimeline, buildTimelineDetail, createTimelineState } from './fold'
+import { type ColdReadGate, makeColdReadGate } from './coldRead'
+import { type ConnectionHostFace, registerPostRoute } from './connection'
+import { applyTimeline } from './fold'
+import { createTimelineState } from './foldState'
+import { buildTimelineDetail, buildTimelineHead } from './foldWire'
+import type { ContextTimelineDetail, Snapshot } from '../shared/types'
+import type { TimelineState } from './foldState'
 
-/** The plugin's detail route, under the authenticated `/api` fence. */
 export const DETAIL_ROUTE = '/api/dsh-context/detail'
 
-/** The route's liveness, read by the timeline unit's view at every serve. */
+/** ~13ms synchronous fold per chunk, so a cold 30k-event fold yields instead of blocking the request. */
+const FOLD_YIELD_EVENTS = 1_000
+
+/** Cold payload cache: one payload is bounded by the fold bounds (≲1MB), and the durable revision in the key makes a stale serve
+ * structurally impossible, so a page reload re-serves instead of refolding the whole log. */
+const PAYLOAD_CACHE_MAX = 4
+
+/** One cached cold payload: the same `(identity, id, revision)` trust tuple dsh's own observation reader keys its cache on, so a swapped
+ * backend can never alias a stale serve. */
+interface ColdPayload {
+  persistence: unknown
+  revision: string
+  value: ContextTimelineDetail
+}
+
+/** The durable change token; absent on a live observation, a moving target that must never key the cache. */
+function revisionOf(observation: unknown): string | undefined {
+  const revision = (observation as { revision?: unknown } | null)?.revision
+  return typeof revision === 'string' && revision !== '' ? revision : undefined
+}
+
+/** The head-only wire value of a built detail. An absent head rides as `undefined`: the JSON reply drops it, and the
+ * client's re-proof answers the typed malformed failure. */
+function headOfDetail(detail: { rev: number; head?: unknown }): { rev: number; head?: unknown } {
+  return { rev: detail.rev, head: detail.head }
+}
+
+function headPayloadOf(state: TimelineState): { rev: number; head: Snapshot } {
+  return { rev: state.detailRev ?? 0, head: buildTimelineHead(state) }
+}
+
 export interface DetailChannelGate {
   readonly live: boolean
 }
 
-/** The host `connection` service, as far as the route consumes it. */
-interface ConnectionHostFace {
-  fetch?: {
-    // The handler's result is awaited by the transport; the cold rung below
-    // awaits the observation read.
-    register?(route: {
-      path: string
-      methods: readonly string[]
-      requestBody: 'buffered'
-      fetch: (request: Request) => Promise<Response>
-    }): () => void
-  }
-}
-
-/** The host `sessions` service, as far as the route consumes it (the strict-global-read idiom). */
 interface SessionsHostFace {
   get?(id: string): unknown
 }
 
-/**
- * The host `sessionQuery` service, as far as the route consumes it: the
- * prepared-observation read that folds a session only ever VIEWED cold.
- */
 interface SessionQueryFace {
   observeSession?(id: string, options: unknown): Promise<unknown>
 }
 
-/** One JSON reply of the detail route. */
 function reply(value: unknown): Response {
   return Response.json(value, { headers: { 'cache-control': 'no-store' } })
 }
 
-/** The typed failure envelope (the same shape the Connection RPC carried). */
 function failure(code: string, message: string): Response {
   return reply({ ok: false, error: { code, message } })
 }
 
-/**
- * Serve the detail route whenever the connection and sessions services are
- * both composed (see the module header for the load-order contract). The
- * registration rides the injected fiber: either service unloading withdraws
- * the route and closes the gate.
- */
-export function watchDetailChannel(ctx: Context, bounds: FoldBounds): DetailChannelGate {
+/** Either service unloading withdraws the route and closes the gate. */
+export function watchDetailChannel(ctx: Context, bounds: FoldBounds, coldReads: ColdReadGate = makeColdReadGate()): DetailChannelGate {
   const gate = { live: false }
+  // The cold payload cache lives in this closure: a config remount re-runs the watch, so a bounds change never serves a payload folded
+  // under different bounds.
+  const payloads = new Map<string, ColdPayload>()
   ctx.inject(['connection', 'sessions'], (c) => {
-    const connection = c.get('connection') as ConnectionHostFace | undefined
     const sessions = c.get('sessions') as SessionsHostFace | undefined
-    // Bind at extraction (an unbound hand-off loses `this` on the real faces).
-    const register = typeof connection?.fetch?.register === 'function'
-      ? connection.fetch.register.bind(connection.fetch)
-      : undefined
     const getSession = typeof sessions?.get === 'function' ? sessions.get.bind(sessions) : undefined
-    if (register === undefined || getSession === undefined) return
+    if (getSession === undefined) return
     const projections = ctx.sessionProjections
 
     const handler = async (request: Request): Promise<Response> => {
       let sessionId: unknown
+      let headOnly = false
       try {
         const body: unknown = await request.json()
         sessionId = body !== null && typeof body === 'object'
           ? (body as { sessionId?: unknown }).sessionId
           : undefined
+        headOnly = body !== null && typeof body === 'object' && (body as { head?: unknown }).head === true
       } catch {
         return failure('dsh-context/bad-request', 'body is not JSON')
       }
@@ -119,53 +95,68 @@ export function watchDetailChannel(ctx: Context, bounds: FoldBounds): DetailChan
       try {
         const session = getSession(sessionId)
         if (session !== undefined && session !== null) {
-          // Live (attached) session: read the registry's CURRENT fold state —
-          // no second fold. `stateOf` materializes the cell at the session
-          // cursor (no-op when the drive is current); never mutate the result.
+          // Live session: the registry's current fold state — no second fold, and it is never mutated.
           const state = projections.stateOf(session as never, 'contextTimeline')
-          // The unit is absent only in the baseline-gated composition, which never
-          // installs this route — a miss is defensive.
           if (state === undefined) return reply({ ok: true, value: null })
-          return reply({ ok: true, value: buildTimelineDetail(state, bounds) })
+          // A head read (the agent cards) serves the envelope scalars only: the collections are ~200× the bytes and
+          // the reader discards them.
+          return reply({ ok: true, value: headOnly ? headPayloadOf(state) : buildTimelineDetail(state, bounds) })
         }
-        // Cold session (viewed through a prepared observation, never entered
-        // into the live store): observe it and fold the detail from its
-        // immutable log. The lease disposes promptly; the query's prepared
-        // cache retains the session for reuse. A session nothing can observe
-        // resolves to the typed null — the client keeps its last detail.
+        // Cold session: observe it and fold from its immutable log through the shared cold-read gate; a skip under heap
+        // pressure resolves to the same typed null, and an unchanged durable revision re-serves the cached payload.
         const query = ctx.get('sessionQuery') as SessionQueryFace | undefined
         const observe = typeof query?.observeSession === 'function'
           ? query.observeSession.bind(query)
           : undefined
         if (observe === undefined) return reply({ ok: true, value: null })
-        const observation = await observe(sessionId, { projectionMode: 'none' })
-        const events = (observation as { events?: unknown } | null)?.events
-        if (!Array.isArray(events)) return reply({ ok: true, value: null })
-        let state = createTimelineState()
-        try {
-          for (const ev of events) state = applyTimeline(state, ev as never, bounds)
-        } finally {
-          const dispose = (observation as { [Symbol.dispose]?: unknown } | null)?.[Symbol.dispose]
-          if (typeof dispose === 'function') dispose.call(observation)
-        }
-        return reply({ ok: true, value: buildTimelineDetail(state, bounds) })
+        const value = await coldReads.admit(async () => {
+          const observation = await observe(sessionId, { projectionMode: 'none' })
+          try {
+            const persistence: unknown = ctx.get('sessionPersistence')
+            const revision = revisionOf(observation)
+            if (revision !== undefined) {
+              const hit = payloads.get(sessionId)
+              if (hit !== undefined && hit.revision === revision && hit.persistence === persistence) {
+                payloads.delete(sessionId)
+                payloads.set(sessionId, hit)
+                return headOnly ? headOfDetail(hit.value) : hit.value
+              }
+            }
+            const events = (observation as { events?: unknown } | null)?.events
+            if (!Array.isArray(events)) return null
+            let state = createTimelineState()
+            let folded = 0
+            for (const ev of events) {
+              state = applyTimeline(state, ev as never, bounds)
+              if (++folded % FOLD_YIELD_EVENTS === 0) await new Promise(resolve => setTimeout(resolve, 0))
+            }
+            // The full detail is built (and cached) whenever the durable revision can key it, so a later full read
+            // re-serves; only an unkeyable read skips the collections build when just the head was asked.
+            if (revision !== undefined) {
+              const detail = buildTimelineDetail(state, bounds)
+              payloads.delete(sessionId)
+              payloads.set(sessionId, { persistence, revision, value: detail })
+              for (const oldest of payloads.keys()) {
+                if (payloads.size <= PAYLOAD_CACHE_MAX) break
+                payloads.delete(oldest)
+              }
+              return headOnly ? headOfDetail(detail) : detail
+            }
+            if (headOnly) return headPayloadOf(state)
+            return buildTimelineDetail(state, bounds)
+          } finally {
+            const dispose = (observation as { [Symbol.dispose]?: unknown } | null)?.[Symbol.dispose]
+            if (typeof dispose === 'function') dispose.call(observation)
+          }
+        })
+        return reply({ ok: true, value: value ?? null })
       } catch (err) {
         return failure('gateway/internal', err instanceof Error ? err.message : String(err))
       }
     }
 
-    try {
-      c.effect(() => register({
-        path: DETAIL_ROUTE,
-        methods: ['POST'],
-        requestBody: 'buffered',
-        fetch: handler,
-      }), 'dsh-context: detail route')
-    } catch {
-      // A hostile or rejecting registry must not take the plugin down — the
-      // gate stays closed and the wire value stays inline.
-      return
-    }
+    // A hostile or rejecting registry leaves the route absent: the gate stays closed.
+    if (!registerPostRoute(c, c.get('connection') as ConnectionHostFace | undefined, DETAIL_ROUTE, handler, 'dsh-context: detail route')) return
     gate.live = true
     return () => {
       gate.live = false

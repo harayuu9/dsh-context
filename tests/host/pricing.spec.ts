@@ -1,7 +1,3 @@
-// Unit tests for the token-pricing heuristic (src/host/pricing.ts) — a mirror
-// of the harness token-meter's fixed-density estimator with the image-block
-// refinement. Pure functions: each case constructs a real payload and prices it.
-
 import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
 import {
@@ -47,11 +43,13 @@ describe('estimateMessage', () => {
     assert.equal(estimateMessage({ content: [{ type: 'tool-call' }] }), 8)
   })
 
-  test('tool-result blocks price their nested content recursively', () => {
+  test('a retired wrapper block prices as generic JSON (the meter parity branch)', () => {
+    // The supported log generation carries no wrapper blocks; a hostile one prices through the structural-JSON
+    // arm the meter applies to every unknown block.
+    const block = { type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }
     assert.equal(
-      estimateMessage({ content: [{ type: 'tool-result', content: [{ type: 'text', text: 'ok' }] }] }),
-      // inner text: ceil(2/4)+4 = 5; wrapper: +4; role: +4
-      13,
+      estimateMessage({ content: [block] }),
+      4 + Math.ceil(JSON.stringify(block).length / 4) + 4,
     )
   })
 
@@ -64,7 +62,6 @@ describe('estimateMessage', () => {
   })
 
   test('image blocks with known dimensions price through the vision calculator', () => {
-    // 800×600 → 341 (docs-verified) +4 block +4 role
     assert.equal(
       estimateMessage({ content: [{ type: 'image', attachment: { width: 800, height: 600 } }] }),
       341 + 8,
@@ -103,7 +100,6 @@ describe('estimateMessage', () => {
     assert.equal(estimateMessage({}, true), 0)
     assert.equal(estimateMessage({ content: [] }, true), 0)
     assert.equal(estimateMessage({ content: 'x' as never }, true), 0)
-    // …but a non-empty message still prices normally under emptyIsZero.
     assert.equal(estimateMessage({ content: [{ type: 'text', text: 'abcd' }] }, true), 9)
   })
 
@@ -243,8 +239,8 @@ describe('isInjection', () => {
 
   test('any non-user kind is an injection, even with a form', () => {
     assert.equal(isInjection({ kind: 'plugin', form: 'notice' }), true)
-    // 'user-rpc' keeps kind "user" in the log but a transport form must not flip the class…
-    assert.equal(isInjection({ kind: 'user', form: 'rpc' }), true) // form fallback, per the fold comment
+    // Any transport form marks an injection even with kind 'user' (the 'user-rpc' spelling).
+    assert.equal(isInjection({ kind: 'user', form: 'rpc' }), true)
   })
 
   test('a foreign source declaring only a form classifies as an injection', () => {
@@ -259,7 +255,6 @@ describe('hostile block shapes', () => {
     assert.equal(imageCountOf(junk), 0)
     assert.equal(firstText(junk), '')
     assert.deepEqual(toolCallNames(junk), [])
-    // A null element nested inside a tool-result block is tolerated too.
     const nested = [{ type: 'tool-result', content: [null, { type: 'image' }] }] as never
     assert.equal(imageCountOf(nested), 1)
     assert.ok(estimateMessage({ content: nested }) > 0)

@@ -1,54 +1,66 @@
-/**
- * The sessions-feed plumbing shared by the session-list consumers — the
- * Agent network card (agentGraph.tsx) and the stats board's subagent-cost
- * cell (statsContext.tsx): the list-snapshot React seat, and the page-scope
- * cache of cold-relative slim-head fetches.
- *
- * The cache: one in-flight-or-settled promise per session id for the
- * factory's lifetime (page scope). A settled null — transport failure,
- * hostile payload, route absent, session left the live set — is sticky, so a
- * broken relative never retries per snapshot tick. One cache serves every
- * consumer, so a relative's head is fetched once no matter how many cards
- * read it.
- */
-
 import { useCallback, useSyncExternalStore } from 'react'
 import type { ContextTimeline } from '../shared/types'
-import type { ClientCtx } from './services'
 import type { SessionsFaceLike } from './agentTree'
-import { makeDetailFetcher } from './timelineSource'
+import { DETAIL_ROUTE } from './apiRoutes'
+import { lruTouch, lruTrim } from './lru'
+import { asRecord, timelineOf } from './services'
 
 export interface AgentHeads {
-  /** The session's slim head off the (deduplicated) detail route; null when absent or failed. */
   headOf(id: string): Promise<ContextTimeline | null>
 }
 
-/** One page-scope fetch cache, shared by every consumer the caller wires it into. */
-export function makeAgentHeads(ctx: ClientCtx): AgentHeads {
+/** One relative-agent head read: the detail route's `head: true` body serves the slim envelope (~1KB) instead of the
+ * ~200× larger full detail the reader would discard. */
+export function makeHeadFetcher(sessionId: string): (() => Promise<ContextTimeline | null>) | undefined {
+  if (sessionId === '') return undefined
+  return async () => {
+    const response = await fetch(DETAIL_ROUTE, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId, head: true }),
+    })
+    if (!response.ok) throw new Error(`dsh-context: head route HTTP ${response.status}`)
+    const r = asRecord(await response.json())
+    if (r === null || r.ok !== true) throw new Error('dsh-context: head read failed')
+    if (r.value === null) return null
+    const head = timelineOf(asRecord(r.value)?.head)
+    if (head === null) throw new Error('dsh-context: head read malformed')
+    return head
+  }
+}
+
+/** Page-scope head cache bound: heads are ~1KB each, but an unbounded page-lifetime map still accumulates one entry
+ * per session the Fleet/agent views ever touched; the least-recently-read entry is dropped at the cap. */
+const HEADS_MAX = 128
+
+export function makeAgentHeads(): AgentHeads {
   const heads = new Map<string, Promise<ContextTimeline | null>>()
   return {
     headOf(id: string): Promise<ContextTimeline | null> {
       const cached = heads.get(id)
-      if (cached !== undefined) return cached
-      const fetcher = makeDetailFetcher(ctx, id)
-      const pending = fetcher !== undefined ? fetcher().then(d => d?.head ?? null) : Promise.resolve(null)
+      if (cached !== undefined) {
+        lruTouch(heads, id)
+        return cached
+      }
+      const fetcher = makeHeadFetcher(id)
+      const pending = fetcher !== undefined ? fetcher() : Promise.resolve(null)
       heads.set(id, pending)
+      lruTrim(heads, HEADS_MAX)
       return pending
     },
   }
 }
 
-/** The session-list snapshot as a React seat (null without the face). */
 export function useSessionsSnapshot(face: SessionsFaceLike | null): unknown {
   const subscribe = useCallback((fn: () => void) => {
     if (face === null) return () => {}
-    /* v8 ignore next 2 -- sessionsFaceOf returns a face only after proving list.subscribe. */
+    /* v8 ignore next 2 -- unreachable: sessionsFaceOf proved list.subscribe before returning the face. */
     if (face.list === undefined) return () => {}
     return face.list.subscribe(fn)
   }, [face])
   const getSnapshot = useCallback(() => {
     if (face === null) return null
-    /* v8 ignore next 2 -- sessionsFaceOf proves list before returning the face. */
+    /* v8 ignore next 2 -- unreachable: sessionsFaceOf proved list before returning the face. */
     if (face.list === undefined) return null
     return face.list.getSnapshot()
   }, [face])

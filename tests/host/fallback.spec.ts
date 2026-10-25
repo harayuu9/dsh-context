@@ -1,9 +1,3 @@
-// The baseline gate's fallback units (src/host/fallback.ts), driven over the
-// REAL session-projection registry: the gate's value arrives through the
-// ordinary snapshot cut no matter what the log carries, both registry
-// contract generations read their own shape off the definition, and cached
-// rows from either direction seed harmlessly.
-
 import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
@@ -13,7 +7,8 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { createFallbackActivityDefinition, createFallbackHeadersDefinition, createFallbackTimelineDefinition } from '../../src/host/fallback'
 import { BASELINE_DSH_VERSION } from '../../src/shared/version'
 
-const CURRENT = '0.1.1-rc.2'
+// One rc below the raised floor: the version a just-below-floor deployment reports.
+const CURRENT = '0.2.0-rc.1'
 
 async function boot() {
   const ctx = new Context()
@@ -76,8 +71,7 @@ describe('fallback units over the real registry', () => {
 
   test('the state schema strips any cached row instead of rejecting it', () => {
     const timeline = createFallbackTimelineDefinition(CURRENT)
-    // A ver-1 row of the REAL headers unit ({headers: [...]}) or any other
-    // persisted shape seeds the gate's fold stripped to the empty state.
+    // A ver-1 row of the REAL headers unit or any other persisted shape seeds the fold stripped to the empty state.
     assert.deepEqual(timeline.stateSchema.parse({ headers: [{ seq: 1 }] }), {})
     assert.deepEqual(timeline.stateSchema.parse({ surface: [null], sums: {} }), {})
     assert.equal(timeline.stateVersion, 1)

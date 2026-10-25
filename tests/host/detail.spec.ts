@@ -1,16 +1,11 @@
-// The on-demand detail route (src/host/detail.ts): the nested-inject gating
-// on the connection/sessions faces (load-order independent), the gate's live
-// flip on unload, and the route's typed outcomes — the detail payload off the
-// live fold state, the typed `null` for a gone session or an absent unit, and
-// the failure envelope for bad payloads and hostile reads (the route must
-// never throw into the transport).
-
 import assert from 'node:assert/strict'
-import { describe, test } from 'vitest'
+import { describe, test, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { DETAIL_ROUTE, watchDetailChannel } from '../../src/host/detail'
 import { resolveBounds } from '../../src/host/config'
 import type { TimelineState } from '../../src/host/fold'
+import { buildTimelineDetail } from '../../src/host/foldWire'
+import type { TimelineEvent } from '../../src/host/foldState'
 import { assistantMessage, header, userMessage } from './helpers/events'
 import { driveTimeline } from './helpers/projection'
 
@@ -22,14 +17,12 @@ interface CtxSpec {
   connection?: unknown
   sessions?: unknown
   sessionQuery?: unknown
+  sessionPersistence?: unknown
   stateOf?: (session: unknown, key: string) => unknown
 }
 
-/**
- * A minimal host ctx double with cordis inject semantics: the callback runs
- * once its dependency list completes (here: immediately when the services
- * map has them, never otherwise), and its returned disposer is collected.
- */
+/** A minimal host ctx double with cordis inject semantics: the callback runs once its dependency list
+ * completes, and its returned disposer is collected. */
 function ctxOf(spec: CtxSpec): { ctx: Context; captured: { path?: string; fetch?: RouteFetch }; disposers: (() => void)[] } {
   const captured: { path?: string; fetch?: RouteFetch } = {}
   const disposers: (() => void)[] = []
@@ -37,6 +30,7 @@ function ctxOf(spec: CtxSpec): { ctx: Context; captured: { path?: string; fetch?
   if ('connection' in spec) services.set('connection', spec.connection)
   if ('sessions' in spec) services.set('sessions', spec.sessions)
   if ('sessionQuery' in spec) services.set('sessionQuery', spec.sessionQuery)
+  if ('sessionPersistence' in spec) services.set('sessionPersistence', spec.sessionPersistence)
   const ctx = {
     get: (name: string) => services.get(name),
     sessionProjections: { stateOf: spec.stateOf ?? (() => undefined) },
@@ -51,7 +45,6 @@ function ctxOf(spec: CtxSpec): { ctx: Context; captured: { path?: string; fetch?
       if (typeof d === 'function') disposers.push(d as () => void)
     },
   }
-  // Wire the connection face so register() captures its route.
   if (spec.connection !== undefined && spec.connection !== null) {
     const conn = spec.connection as { fetch?: { register?: unknown } }
     if (typeof conn.fetch?.register === 'function') {
@@ -65,7 +58,6 @@ function ctxOf(spec: CtxSpec): { ctx: Context; captured: { path?: string; fetch?
   return { ctx: ctx as unknown as Context, captured, disposers }
 }
 
-/** POST one JSON body to the captured route and parse the JSON reply. */
 async function call(captured: { fetch?: RouteFetch }, body: unknown): Promise<Record<string, unknown>> {
   const request = new Request(`http://dsh.test${DETAIL_ROUTE}`, {
     method: 'POST',
@@ -76,7 +68,6 @@ async function call(captured: { fetch?: RouteFetch }, body: unknown): Promise<Re
   return await response.json() as Record<string, unknown>
 }
 
-/** POST one raw (non-JSON) body to the captured route. */
 async function callRaw(captured: { fetch?: RouteFetch }, body: string): Promise<Record<string, unknown>> {
   const request = new Request(`http://dsh.test${DETAIL_ROUTE}`, {
     method: 'POST',
@@ -86,7 +77,6 @@ async function callRaw(captured: { fetch?: RouteFetch }, body: string): Promise<
   return await captured.fetch!(request).then(r => r.json()) as Record<string, unknown>
 }
 
-/** A live sessions face whose get() serves the `s1` id only. */
 function sessionsWith(session: unknown): { get(id: string): unknown } {
   return { get: (id: string) => (id === 's1' ? session : undefined) }
 }
@@ -97,14 +87,10 @@ function okSession(): object {
 
 describe('watchDetailChannel gating', () => {
   test('the gate stays closed without the connection or sessions service', () => {
-    // Neither service.
     assert.equal(watchDetailChannel(ctxOf({}).ctx, BOUNDS).live, false)
-    // Sessions only.
     assert.equal(watchDetailChannel(ctxOf({ sessions: sessionsWith(okSession()) }).ctx, BOUNDS).live, false)
-    // Connection only.
     const connOnly = ctxOf({ connection: { fetch: { register: () => () => {} } } })
     assert.equal(watchDetailChannel(connOnly.ctx, BOUNDS).live, false)
-    // A connection without the fetch.register face, or a sessions without get.
     assert.equal(watchDetailChannel(ctxOf({ connection: { fetch: {} }, sessions: sessionsWith(okSession()) }).ctx, BOUNDS).live, false)
     assert.equal(watchDetailChannel(ctxOf({
       connection: { fetch: { register: () => () => {} } },
@@ -121,7 +107,6 @@ describe('watchDetailChannel gating', () => {
     assert.equal(gate.live, true)
     assert.equal(captured.path, '/api/dsh-context/detail')
     assert.equal(typeof captured.fetch, 'function')
-    // Unload: the inject fiber's disposer closes the gate (the wire flips back to inline).
     for (const d of disposers) d()
     assert.equal(gate.live, false)
   })
@@ -222,7 +207,6 @@ describe('the detail route', () => {
     assert.ok(result.value.head.current.total > 0, 'the slim head rides the cold fold (the graph ring fetch)')
     assert.deepEqual(observedOptions, { projectionMode: 'none' }, 'the observation skips projection work')
     assert.equal(disposed, 1, 'the observation lease disposed after the fold')
-    // A session nothing can observe (the query resolves null) stays a typed null.
     assert.deepEqual(await call(captured, { sessionId: 'nobody' }), { ok: true, value: null })
   })
 
@@ -243,7 +227,6 @@ describe('the detail route', () => {
   })
 
   test('a sessionQuery without the observe face (or a rejecting read) degrades cleanly', async () => {
-    // Face present but the method missing.
     const noFace = ctxOf({
       connection: { fetch: { register: () => () => {} } },
       sessions: sessionsWith(okSession()),
@@ -251,8 +234,6 @@ describe('the detail route', () => {
     })
     watchDetailChannel(noFace.ctx, BOUNDS)
     assert.deepEqual(await call(noFace.captured, { sessionId: 'cold' }), { ok: true, value: null })
-
-    // The observation read rejects (persistence down).
     const rejecting = ctxOf({
       connection: { fetch: { register: () => () => {} } },
       sessions: sessionsWith(okSession()),
@@ -265,6 +246,42 @@ describe('the detail route', () => {
     assert.equal(result.ok, false)
     assert.equal(result.error.code, 'gateway/internal')
     assert.equal(result.error.message, 'persistence down')
+  })
+
+  test('a cold read skipped under heap pressure answers the typed null (and never observes)', async () => {
+    let observed = 0
+    const { ctx, captured } = ctxOf({
+      connection: { fetch: { register: () => () => {} } },
+      sessions: sessionsWith(okSession()),
+      stateOf: () => undefined,
+      sessionQuery: {
+        observeSession: () => {
+          observed++
+          return Promise.resolve({ events: [] })
+        },
+      },
+    })
+    let admitted = 0
+    watchDetailChannel(ctx, BOUNDS, {
+      admit: <T>(_read: () => Promise<T>): Promise<T | undefined> => {
+        admitted++
+        return Promise.resolve(undefined)
+      },
+    })
+    assert.deepEqual(await call(captured, { sessionId: 'cold1' }), { ok: true, value: null })
+    assert.equal(admitted, 1, 'the cold read went through the gate')
+    assert.equal(observed, 0, 'a skipped read never touches the log')
+  })
+
+  test('the live path never touches the cold-read gate', async () => {
+    const { state } = driveTimeline([userMessage(1, [{ type: 'text', text: 'hi' }], { kind: 'user' })])
+    const { ctx, captured } = liveCtx(state)
+    watchDetailChannel(ctx, BOUNDS, {
+      admit: () => Promise.reject(new Error('the gate must not see a live read')),
+    })
+    const result = await call(captured, { sessionId: 's1' }) as { ok: boolean; value: { rev: number } | null }
+    assert.equal(result.ok, true)
+    assert.ok(result.value !== null, 'the live read served its detail without the gate')
   })
 
   test('serves the fold state\'s detail payload with its revision', async () => {
@@ -283,8 +300,75 @@ describe('the detail route', () => {
     assert.ok(result.value.head.current.total > 0, 'the slim head rides the live read too')
   })
 
+  test('a head read serves the envelope only, live and cold', async () => {
+    const { state } = driveTimeline([
+      header(1, { model: 'deepseek-v4-flash', provider: 'deepseek' }),
+      userMessage(2, [{ type: 'text', text: 'hi' }], { kind: 'user' }),
+      assistantMessage(3, { turn: 1, step: 0, usage: { inputTokens: 10, outputTokens: 5 } }),
+    ])
+    const live = liveCtx(state)
+    watchDetailChannel(live.ctx, BOUNDS)
+    const liveHead = await call(live.captured, { sessionId: 's1', head: true }) as { ok: true; value: { rev: number; head: { current: { total: number } }; requests?: unknown } }
+    assert.equal(liveHead.ok, true)
+    assert.equal(liveHead.value.rev, 2)
+    assert.ok(liveHead.value.head.current.total > 0)
+    assert.equal(liveHead.value.requests, undefined, 'the collections never ride a head read')
+
+    // A state that never bumped the detail revision (a header alone) serves the zero rev.
+    const fresh = liveCtx(driveTimeline([header(1, { model: 'deepseek-v4-flash', provider: 'deepseek' })]).state)
+    watchDetailChannel(fresh.ctx, BOUNDS)
+    const freshHead = await call(fresh.captured, { sessionId: 's1', head: true }) as { ok: true; value: { rev: number; head: { model?: unknown } } }
+    assert.equal(freshHead.value.rev, 0)
+    assert.equal(freshHead.value.head.model, 'deepseek-v4-flash')
+
+    const cold = ctxOf({
+      connection: { fetch: { register: () => () => {} } },
+      sessions: sessionsWith(okSession()),
+      stateOf: () => undefined,
+      sessionQuery: { observeSession: () => Promise.resolve({
+        revision: 'rev-1',
+        events: [
+          header(1, { model: 'deepseek-v4-flash', provider: 'deepseek' }),
+          userMessage(2, [{ type: 'text', text: 'hi' }], { kind: 'user' }),
+          assistantMessage(3, { turn: 1, step: 0, usage: { inputTokens: 10, outputTokens: 5 } }),
+        ],
+        [Symbol.dispose]: () => {},
+      }) },
+      sessionPersistence: { backend: 'default' },
+    })
+    watchDetailChannel(cold.ctx, BOUNDS)
+    const coldHead = await call(cold.captured, { sessionId: 'cold1', head: true }) as { ok: true; value: { rev: number; head: { model?: unknown }; requests?: unknown } }
+    assert.equal(coldHead.ok, true)
+    assert.ok(coldHead.value.head !== undefined)
+    assert.equal(coldHead.value.requests, undefined, 'the cold head read serves the envelope only')
+    // The cold read still caches the FULL payload at its revision, so a later full read re-serves it.
+    const full = await call(cold.captured, { sessionId: 'cold1' }) as { ok: true; value: { requests: unknown[] } }
+    assert.equal(full.ok, true)
+    assert.ok(Array.isArray(full.value.requests))
+    // The cached payload answers a repeat head read at the same revision.
+    const cachedHead = await call(cold.captured, { sessionId: 'cold1', head: true }) as { ok: true; value: { rev: number; head?: unknown } }
+    assert.equal(cachedHead.ok, true)
+    assert.ok(cachedHead.value.head !== undefined)
+
+    // A head read whose observation carries no durable revision folds and serves the head without caching.
+    const unkeyed = ctxOf({
+      connection: { fetch: { register: () => () => {} } },
+      sessions: sessionsWith(okSession()),
+      stateOf: () => undefined,
+      sessionQuery: { observeSession: () => Promise.resolve({
+        // A header alone never bumps the detail revision, so the unkeyed head path reads the zero rev.
+        events: [header(1, { model: 'deepseek-v4-flash', provider: 'deepseek' })],
+        [Symbol.dispose]: () => {},
+      }) },
+      sessionPersistence: { backend: 'default' },
+    })
+    watchDetailChannel(unkeyed.ctx, BOUNDS)
+    const unkeyedHead = await call(unkeyed.captured, { sessionId: 'cold2', head: true }) as { ok: true; value: { rev: number; head: { model?: unknown } } }
+    assert.equal(unkeyedHead.ok, true)
+    assert.equal(unkeyedHead.value.head.model, 'deepseek-v4-flash')
+  })
+
   test('hostile reads degrade to the failure envelope, never a throw', async () => {
-    // sessions.get throwing.
     const throwingGet = ctxOf({
       connection: { fetch: { register: () => () => {} } },
       sessions: {
@@ -298,8 +382,6 @@ describe('the detail route', () => {
     assert.equal(r1.ok, false)
     assert.equal(r1.error.code, 'gateway/internal')
     assert.equal(r1.error.message, 'hostile sessions')
-
-    // stateOf throwing.
     const throwingState = ctxOf({
       connection: { fetch: { register: () => () => {} } },
       sessions: sessionsWith(okSession()),
@@ -335,5 +417,157 @@ describe('the detail route', () => {
     const r4 = await call(stringThrow.captured, { sessionId: 's1' }) as { ok: boolean; error: { message: string } }
     assert.equal(r4.ok, false)
     assert.equal(r4.error.message, 'string boom')
+  })
+})
+
+describe('the cold fold (issue #145)', () => {
+  function coldCtx(observe: (id: string) => Promise<unknown>, persistence: unknown = { backend: 'default' }): { ctx: Context; captured: { fetch?: RouteFetch } } {
+    return ctxOf({
+      connection: { fetch: { register: () => () => {} } },
+      sessions: sessionsWith(okSession()),
+      stateOf: () => undefined,
+      sessionQuery: { observeSession: (id: string) => observe(id) },
+      sessionPersistence: persistence,
+    })
+  }
+
+  function manyEvents(count: number): TimelineEvent[] {
+    const events: TimelineEvent[] = [header(1, { model: 'deepseek-v4-flash', provider: 'deepseek' })]
+    for (let seq = 2; seq <= count; seq++) {
+      events.push(seq % 2 === 0
+        ? userMessage(seq, [{ type: 'text', text: `question ${seq}` }], { kind: 'user' })
+        : assistantMessage(seq, { turn: seq, step: seq, usage: { inputTokens: 10, outputTokens: 5 } }))
+    }
+    return events
+  }
+
+  test('a monster log folds to the byte-identical detail, yielding to the event loop per chunk', async () => {
+    const events = manyEvents(2_001)
+    const { ctx, captured } = coldCtx(() => Promise.resolve({ events, [Symbol.dispose]: () => {} }))
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout')
+    try {
+      watchDetailChannel(ctx, BOUNDS)
+      const result = await call(captured, { sessionId: 'cold1' }) as { ok: boolean; value: unknown }
+      assert.equal(result.ok, true)
+      const reference = buildTimelineDetail(driveTimeline(events).state, BOUNDS)
+      assert.deepStrictEqual(result.value, reference, 'the yielding fold produces the identical payload')
+      const yields = timerSpy.mock.calls.filter(args => args[1] === 0).length
+      assert.equal(yields, 2, 'two macrotask yields across 2,001 events')
+    } finally {
+      timerSpy.mockRestore()
+    }
+  })
+
+  test('an unchanged log (same durable revision) re-serves the payload without refolding', async () => {
+    const events = manyEvents(5)
+    let eventReads = 0
+    let disposed = 0
+    const { ctx, captured } = coldCtx(() => Promise.resolve({
+      revision: 'dev:ino:100:42:42',
+      get events() {
+        eventReads++
+        return events
+      },
+      [Symbol.dispose]: () => { disposed++ },
+    }))
+    watchDetailChannel(ctx, BOUNDS)
+    const first = await call(captured, { sessionId: 'cold1' })
+    const second = await call(captured, { sessionId: 'cold1' })
+    assert.equal(eventReads, 1, 'the second read never touched the log')
+    assert.deepEqual(second, first, 'the re-served payload is identical')
+    assert.equal(disposed, 2, 'both observation leases released')
+  })
+
+  test('a changed revision refolds (no stale payload, ever)', async () => {
+    const events = manyEvents(5)
+    let eventReads = 0
+    let revision = 'r1'
+    const { ctx, captured } = coldCtx(() => Promise.resolve({
+      get revision() { return revision },
+      get events() {
+        eventReads++
+        return events
+      },
+      [Symbol.dispose]: () => {},
+    }))
+    watchDetailChannel(ctx, BOUNDS)
+    await call(captured, { sessionId: 'cold1' })
+    revision = 'r2' // the log moved: a new durable revision must fold again
+    await call(captured, { sessionId: 'cold1' })
+    assert.equal(eventReads, 2, 'the changed log refolded instead of serving stale data')
+  })
+
+  test('an observation without a revision (a live-race cut) never keys the cache', async () => {
+    const events = manyEvents(5)
+    let eventReads = 0
+    const { ctx, captured } = coldCtx(() => Promise.resolve({
+      get events() {
+        eventReads++
+        return events
+      },
+      [Symbol.dispose]: () => {},
+    }))
+    watchDetailChannel(ctx, BOUNDS)
+    await call(captured, { sessionId: 'cold1' })
+    await call(captured, { sessionId: 'cold1' })
+    assert.equal(eventReads, 2, 'no revision — every read folds, as before')
+  })
+
+  test('the cache holds four sessions; the evicted oldest refolds, the kept newest re-serves', async () => {
+    const reads = new Map<string, number>()
+    const { ctx, captured } = coldCtx((id) => Promise.resolve({
+      revision: `r-${id}`,
+      get events() {
+        reads.set(id, (reads.get(id) ?? 0) + 1)
+        return manyEvents(5)
+      },
+      [Symbol.dispose]: () => {},
+    }))
+    watchDetailChannel(ctx, BOUNDS)
+    for (const id of ['c1', 'c2', 'c3', 'c4', 'c5']) await call(captured, { sessionId: id })
+    assert.deepEqual([...reads.values()], [1, 1, 1, 1, 1], 'every first read folded')
+    await call(captured, { sessionId: 'c5' })
+    assert.equal(reads.get('c5'), 1, 'the newest entry survived eviction')
+    await call(captured, { sessionId: 'c1' })
+    assert.equal(reads.get('c1'), 2, 'the evicted oldest refolded on its next read')
+  })
+
+  test('a swapped persistence instance can never alias a stale payload (the dsh trust tuple)', async () => {
+    const events = manyEvents(5)
+    let eventReads = 0
+    const observe = (): Promise<unknown> => Promise.resolve({
+      revision: 'same-token-from-two-backends',
+      get events() {
+        eventReads++
+        return events
+      },
+      [Symbol.dispose]: () => {},
+    })
+    const first = coldCtx(observe, { backend: 'one' })
+    watchDetailChannel(first.ctx, BOUNDS)
+    await call(first.captured, { sessionId: 'cold1' })
+    const second = coldCtx(observe, { backend: 'two' })
+    watchDetailChannel(second.ctx, BOUNDS)
+    await call(second.captured, { sessionId: 'cold1' })
+    assert.equal(eventReads, 2, 'a replaced persistence invalidates every cached payload')
+  })
+
+  test('a remount (a fresh watch closure) starts with an empty cache', async () => {
+    const events = manyEvents(5)
+    let eventReads = 0
+    const { ctx, captured } = coldCtx(() => Promise.resolve({
+      revision: 'r1',
+      get events() {
+        eventReads++
+        return events
+      },
+      [Symbol.dispose]: () => {},
+    }))
+    watchDetailChannel(ctx, BOUNDS)
+    await call(captured, { sessionId: 'cold1' })
+    // The second watch (the config remount's re-arm) shares nothing with the first.
+    watchDetailChannel(ctx, BOUNDS)
+    await call(captured, { sessionId: 'cold1' })
+    assert.equal(eventReads, 2, 'the remounted route folds against its own cache')
   })
 })

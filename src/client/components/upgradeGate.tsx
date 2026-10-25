@@ -1,27 +1,16 @@
-/**
- * The baseline-gate modal: when the host reports the running harness below
- * the supported baseline (the `unsupported` record on the pushed
- * `contextTimeline` value — see host/fallback.ts), the Context tab keeps
- * rendering its (zeroed) cards and this centered dialog names the detected
- * harness version against the required minimum and urges the upgrade.
- *
- * Dismissal is remembered per session in a module-level ledger: tab remounts
- * do not re-pop it, while a fresh app launch does — the gate stays visible
- * until the harness is actually updated.
- */
+/** The baseline-gate modal: when the host reports a harness below the supported baseline, the tab keeps rendering its
+ * zeroed cards and this dialog names the detected version. Dismissal lives in a module-level per-session ledger. */
 
 import { useCallback, useState, type ReactElement } from 'react'
 import type { ViewKit } from '../viewkit'
 import { useEscapeClose } from './escapeClose'
 
-/** Sessions whose gate the user already dismissed this browser session. */
 const dismissed = new Set<string>()
 
 export interface UpgradeGateProps {
   sessionId?: string
-  /** The detected harness version (displayed verbatim, already re-proved). */
+  /** The detected harness version, already re-proved. */
   current: string
-  /** The plugin's minimum supported baseline. */
   minimum: string
 }
 
@@ -29,8 +18,7 @@ export function makeUpgradeGate(kit: ViewKit): (props: UpgradeGateProps) => Reac
   const { t } = kit
   return function UpgradeGate(props: UpgradeGateProps): ReactElement | null {
     const sessionId = typeof props.sessionId === 'string' ? props.sessionId : ''
-    // `closedFor` re-renders on dismiss within one mount; the ledger covers
-    // remounts and in-place session switches.
+    // `closedFor` covers dismissals within one mount; the ledger covers remounts and in-place session switches.
     const [closedFor, setClosedFor] = useState<string | null>(null)
     const closed = closedFor === sessionId || dismissed.has(sessionId)
     const close = useCallback(() => {
@@ -38,8 +26,7 @@ export function makeUpgradeGate(kit: ViewKit): (props: UpgradeGateProps) => Reac
       setClosedFor(sessionId)
     }, [sessionId])
 
-    // Same overlay contract as the /context modal (escapeClose.ts):
-    // capture-phase Escape, and focus returns to the pre-open element.
+    // The /context modal's overlay contract: capture-phase Escape, focus restored to the pre-open element.
     useEscapeClose(!closed, close)
 
     if (closed) return null
@@ -49,7 +36,7 @@ export function makeUpgradeGate(kit: ViewKit): (props: UpgradeGateProps) => Reac
         <div className="lc-modal-card lc-gate-card" onClick={(ev) => { ev.stopPropagation() }}>
           <div className="lc-modal-head">
             <span className="lc-modal-title">{t('gate.title')}</span>
-            <button className="lc-modal-close hover:text-(--dsw-alias-label-primary) hover:bg-(--dsw-alias-bg-layer-2)" aria-label={t('cmd.close')} onClick={close}>×</button>
+            <button className="lc-modal-close hover:text-(--dsw-alias-label-primary) hover:bg-(--dsw-alias-interactive-bg-hover)" aria-label={t('cmd.close')} onClick={close}>×</button>
           </div>
           <div className="lc-gate-body">{t('gate.body', { minimum: props.minimum })}</div>
           <div className="lc-gate-versions">

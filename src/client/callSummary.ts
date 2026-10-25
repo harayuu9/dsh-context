@@ -1,13 +1,4 @@
-/**
- * Tool-call argument summaries — shared between the Context browser (row
- * previews) and the step brief (input chips / reply enrichment). A call's
- * preview is its bash-style `description`, or the target path
- * (`file_path`/`path`/`filePath`) for edit/read/write tools.
- */
-
 import type { ConversationNodeLike } from './services'
-// The argument parser lives in the shared layer (shared/fileOps.ts) since the
-// op-log generation — the host fold parses the same raw strings there.
 import { parseCallArgs } from '../shared/fileOps'
 
 export { parseCallArgs }
@@ -36,10 +27,7 @@ export function blockSummaryOf(conv: ConversationNodeLike | undefined): string |
   return null
 }
 
-/**
- * All tool-call names in an assistant conversation node, in order. The fold's surface node keeps `calls` only for TEXT-LESS replies,
- * so a reply carrying both text and calls recovers its call breadcrumb here through the conversation join.
- */
+/** The fold keeps `calls` only for text-less replies; a texted reply recovers them via the conversation join. */
 export function callNamesOf(conv: ConversationNodeLike | undefined): string[] {
   if (conv === undefined || !Array.isArray(conv.blocks)) return []
   const names: string[] = []

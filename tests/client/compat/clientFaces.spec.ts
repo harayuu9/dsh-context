@@ -1,23 +1,13 @@
-// The always-on compatibility matrix — CLIENT side. For every supported dsh
-// baseline (tests/baselines.ts) the plugin's client half is driven through
-// THAT generation's faces: the finalized-nodes seat (`useChat`'s
-// ChatSnapshot), the durable-image loader service, the seq-anchored history
-// face and its response envelope (the remote.session gateway), and the
-// MarkdownText chrome prop (required `labels`). These are the seams whose
-// drift produced the recurring client-side incidents (issues #8, #12, #26).
-//
-// The real-code complement — the ACTUAL dsh sources per tag — runs in the
-// `compat` vitest project (tests/compat/matrix.spec.ts).
-
 import { createElement as h } from 'react'
 import assert from 'node:assert/strict'
 import { describe, test, vi } from 'vitest'
 import { BASELINES } from '../../baselines'
-import { conversationNodesOf, imageLoaderOf, openResourceVia, openSessionVia } from '../../../src/client/services'
+import { conversationNodesOf, imageLoaderOf, openResourceVia, openSessionVia, sessionAddressOf } from '../../../src/client/services'
 import type { SessionStandardProps } from '../../../src/client/services'
 import { makeContentFetcher, watchHistoryFaces } from '../../../src/client/historyPage'
 import { makeRichText } from '../../../src/client/components/richText'
 import { makeContextView } from '../../../src/client/components/contextView'
+import { makeAgentHeads } from '../../../src/client/agentHeads'
 import { createContextSettings } from '../../../src/client/settings'
 import { watchSidebarContextTab } from '../../../src/client/sidebar'
 import { DICT_EN } from '../../../src/client/i18n'
@@ -28,9 +18,10 @@ import { baselineCtx, chatSeat, convNodes } from './baselineFaces'
 
 const kit = makeKit()
 
-// The chrome-prop capture: the plugin must hand EVERY markdown render a
-// well-formed `labels` object (the primitives REQUIRE it). Intercept the
-// primitive.
+/** The plain-session resolver a non-subagent caller passes. */
+const plainOf = (sessionId: string) => () => ({ kind: 'session' as const, sessionId })
+
+// The plugin must hand EVERY markdown render a well-formed `labels` object (the primitives REQUIRE it).
 const captured = vi.hoisted(() => ({ markdownProps: undefined as Record<string, unknown> | undefined }))
 vi.mock('@deepseek-ai/dsh-client-ui-primitives', async () => {
   const React = await import('react')
@@ -39,11 +30,12 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', async () => {
       captured.markdownProps = props
       return React.createElement('div', null, String(props.text ?? ''))
     },
-    // The rich-text copy control's glyphs and clipboard writer; the
-    // Plugin Info card's settings gear.
-    IconCopyOutline16: () => React.createElement('span', null),
-    IconCheckOutline16: () => React.createElement('span', null),
-    IconSettingsOutline14: () => React.createElement('span', null),
+    JsonTree: () => React.createElement('div', null, 'json-tree'),
+    IconCopyOutlineRegular: () => React.createElement('span', null),
+    IconCheckOutlineRegular: () => React.createElement('span', null),
+    IconSettingsOutlineMedium: () => React.createElement('span', null),
+    // The coloring hook's plain fallback: `undefined` runs render the command text uncolored.
+    useCodeHighlighter: () => () => undefined,
     writeClipboard: async () => true,
   }
 })
@@ -70,7 +62,6 @@ for (const baseline of BASELINES) {
     test('the finalized-nodes seat serves the conversation window join', () => {
       const nodes = convNodes()
       assert.deepEqual(conversationNodesOf({ useChat: chatSeat(nodes) }), nodes)
-      // A seat without the legacy slice: no join, no error.
       assert.equal(conversationNodesOf({ useChat: chatSeat(undefined) }), undefined)
     })
 
@@ -86,30 +77,42 @@ for (const baseline of BASELINES) {
 
     test('the targeted content fetch rides the gateway history face and envelope', async () => {
       const { ctx, calls } = baselineCtx()
-      // Arm the declared inject the way the client apply does; the slot is
-      // unloaded afterwards so no face stales into the next test.
+      // Arm the declared inject the way the client apply does; the slot is unloaded afterwards.
       watchHistoryFaces(asClientCtx(ctx))
-      const fetcher = makeContentFetcher('s-face')
+      const fetcher = makeContentFetcher(plainOf('s-face'))
       assert.ok(fetcher !== undefined, 'the baseline history face serves a fetcher')
       const node = await fetcher(4)
       assert.ok(node !== null)
       assert.equal(node.kind, 'user')
       assert.equal(node.seq, 4)
       assert.deepEqual(node.content, [{ type: 'text', text: 'history node hello' }])
-      // The inclusive cut pinned to the seq, the exclusive bound one past it.
       assert.deepEqual(calls.page, [{ address: { kind: 'session', sessionId: 's-face' }, throughSeq: 4, beforeSeq: 5 }])
-      // History is immutable: a re-read never re-fetches.
       await fetcher(4)
+      // History is immutable: a re-read never re-fetches.
       assert.equal(calls.page.length, 1)
       ctx.dispose()
-      assert.equal(makeContentFetcher('s-face'), undefined, 'the unloaded slot leaves no face behind')
+      assert.equal(makeContentFetcher(plainOf('s-face')), undefined, 'the unloaded slot leaves no face behind')
+    })
+
+    test('a subagent child read carries its durable parent address (issue #193)', async () => {
+      const { ctx, calls } = baselineCtx()
+      ctx.setService('sessions', {
+        subagentAddress: (id: string) => ({ parentSessionId: 's-parent', childSessionId: id, mode: 'continuable' }),
+      })
+      watchHistoryFaces(asClientCtx(ctx))
+      const fetcher = makeContentFetcher(() => sessionAddressOf(asClientCtx(ctx), 's-child'))
+      assert.ok(fetcher !== undefined)
+      assert.equal((await fetcher(4))?.kind, 'user')
+      assert.deepEqual(calls.page, [{
+        address: { kind: 'subagent', parentSessionId: 's-parent', childSessionId: 's-child', mode: 'continuable' },
+        throughSeq: 4,
+        beforeSeq: 5,
+      }])
+      ctx.dispose()
     })
 
     test('the session jump rides this generation\'s navigation seam (issue #90)', () => {
-      // The composition this line actually serves: the view-owner face always
-      // (the sidebar row click's own verb), the retired sessions-service verb
-      // only where the line still declares it — on the V4+ line the service
-      // carries NO selection at all, the exact composition issue #90 died on.
+      // The composition this line serves: the view-owner face always, the retired sessions verb only where declared.
       const { ctx } = baselineCtx()
       const nav = baseline.client.sessionNav
       const jumped: string[] = []
@@ -124,10 +127,9 @@ for (const baseline of BASELINES) {
 
     test('a failed history rpc rejects (retryable), never resolving to a fake absence', async () => {
       const { ctx } = baselineCtx()
-      // The inject resolves the page off the `remote` facade — fail it there.
       ctx.setService('remote', { session: { page: () => Promise.resolve({ ok: false }) } })
       watchHistoryFaces(asClientCtx(ctx))
-      const fetcher = makeContentFetcher('s-face')
+      const fetcher = makeContentFetcher(plainOf('s-face'))
       assert.ok(fetcher !== undefined)
       await assert.rejects(fetcher(4))
       ctx.dispose()
@@ -136,7 +138,7 @@ for (const baseline of BASELINES) {
     test('the Context tab renders through the seats of this generation without tripping the error boundary', async () => {
       const { ctx } = baselineCtx()
       const settings = createContextSettings()
-      const View = makeContextView(asClientCtx(ctx), kit, settings)
+      const View = makeContextView(asClientCtx(ctx), kit, settings, makeAgentHeads())
       const nodes = convNodes()
       const props: SessionStandardProps = {
         sessionId: 's-face',
@@ -146,8 +148,6 @@ for (const baseline of BASELINES) {
       const m = await mount(h(View, props))
       const rendered = text(m.container)
       assert.ok(rendered.includes(DICT_EN['overview.title']), 'the tab rendered, not the error card')
-      // Open the user category (row order: system, tools, user, inject, assistant, tool) — its
-      // lone row auto-expands, and the joined full content rides the baseline seat.
       await click(queryAll(m.container, '.lc-br-cat-row')[2])
       assert.ok(text(m.container).includes('window node hello'), 'the conversation-window join surfaced the seat node')
       await m.unmount()
@@ -156,9 +156,7 @@ for (const baseline of BASELINES) {
     test('the right Sidebar Context tab is optional: absent seam = inert, present seam = registered', () => {
       const { ctx } = baselineCtx()
       const settings = createContextSettings()
-      const View = makeContextView(asClientCtx(ctx), kit, settings)
-      // Without the registry (a below-baseline gated host, say), the deferred
-      // inject never fires: no tab, no body seat, no throw.
+      const View = makeContextView(asClientCtx(ctx), kit, settings, makeAgentHeads())
       assert.doesNotThrow(() => {
         watchSidebarContextTab(asClientCtx(ctx), View, kit.t, 'dsh-context')
       })
@@ -178,7 +176,6 @@ for (const baseline of BASELINES) {
 
     test('the Sidebar preview opener is optional: absent face = no opener, present face = wired', () => {
       const { ctx } = baselineCtx()
-      // No column on this generation: the file names keep their system-open only.
       assert.equal(openResourceVia(asClientCtx(ctx)), undefined, 'no navigation face = no preview opener')
       const opened: string[] = []
       ctx.setService('sidebarRight', { openResource: (address: string) => { opened.push(address) } })
@@ -190,11 +187,6 @@ for (const baseline of BASELINES) {
     })
 
     test('a throwing history-service proxy degrades the tab, never crashes it', async () => {
-      // Issue #42: a traced proxy can throw on the property READ itself
-      // ("cannot get property "remote.session" without inject") — arming the
-      // declared inject with such a hostile facade must leave the slot unset
-      // (nothing escapes the callback) and the tab renders with its static
-      // hint instead of crashing.
       const ctx = new TestClientCtx()
       ctx.setService('remote', {
         get session() { throw new Error('cannot get property "remote.session" without inject') },
@@ -203,9 +195,9 @@ for (const baseline of BASELINES) {
         get page() { throw new Error('cannot get property "remote.session" without inject') },
       })
       watchHistoryFaces(asClientCtx(ctx))
-      assert.equal(makeContentFetcher('s-face'), undefined, 'the hostile face left the slot unset')
+      assert.equal(makeContentFetcher(plainOf('s-face')), undefined, 'the hostile face left the slot unset')
       const settings = createContextSettings()
-      const View = makeContextView(asClientCtx(ctx), kit, settings)
+      const View = makeContextView(asClientCtx(ctx), kit, settings, makeAgentHeads())
       const nodes = convNodes()
       const props: SessionStandardProps = {
         sessionId: 's-face',

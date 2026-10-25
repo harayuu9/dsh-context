@@ -1,16 +1,9 @@
-// Donut (src/client/components/donut.tsx) rendered with real React:
-// proportional SVG segments around the center label, with the empty ring
-// fallback and hostile-value skips.
-
 import { createElement as h, useState } from 'react'
 import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
-import { makeDonut } from '../../../src/client/components/donut'
+import { Donut } from '../../../src/client/components/donut'
 import type { DonutSegment } from '../../../src/client/components/donut'
-import { hover, makeKit, mount, query, queryAll, text, unhover } from '../helpers/kit'
-
-const kit = makeKit()
-const Donut = makeDonut(kit)
+import { hover, mount, query, queryAll, text, unhover } from '../helpers/kit'
 
 /** A parent that really holds the hover key, so hovering re-renders the ring. */
 function HoverHarness(props: { segments: DonutSegment[] }) {
@@ -53,8 +46,7 @@ describe('Donut', () => {
     }))
     const circles = queryAll(m.container, 'circle')
     assert.equal(circles.length, 1)
-    // The color rides inline style (var() values can't live in a stroke attribute);
-    // jsdom reports the style keyword in its normalized rgb() spelling.
+    // Inline style because var() cannot live in a stroke attribute; jsdom normalizes it to rgb().
     assert.equal(circles[0].style.stroke, 'rgb(255, 255, 255)')
     await m.unmount()
   })
@@ -67,7 +59,6 @@ describe('Donut', () => {
     assert.equal(queryAll(m.container, 'circle').length, 1)
     assert.ok(query(m.container, '.lc-donut-track'))
     assert.equal(query(m.container, '.lc-donut-center b').textContent, '—')
-    // No center sub when absent.
     assert.equal(queryAll(m.container, '.lc-donut-center span').length, 0)
     await m.unmount()
   })
@@ -95,8 +86,7 @@ describe('Donut slice divider', () => {
       centerTop: 'x',
     }))
     const arcs = queryAll(m.container, '.lc-donut-seg')
-    // Half a gap off each end of both arcs, and both cuts land on the SAME
-    // seam: the ring shows one 0.5-unit opening there, not two.
+    // Half a gap off each end, both cuts on the SAME seam: one 0.5-unit opening there, not two.
     assert.ok(Math.abs(lenOf(arcs[0]) - 29.5) < 1e-9)
     for (let i = 0; i < arcs.length; i++) {
       const end = startOf(arcs[i]) + lenOf(arcs[i])

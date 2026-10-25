@@ -1,28 +1,20 @@
-/**
- * Token heuristics shared by the host fold and the client boundary — the
- * harness token-meter's own fixed-density figure (dsh-token-meter/estimate.ts:
- * ~4 chars ≈ 1 token, +4 role framing). Priced identically on both sides so a
- * legacy value normalized at the client boundary matches what the host view
- * would have served.
- */
+/** Mirrors the harness token-meter's fixed density on both sides (docs/compatibility.md §4). */
 
 const CHARS_PER_TOKEN = 4
 const ROLE_OVERHEAD = 4
+const BLOCK_OVERHEAD = 4
 
-/** Price rendered system-prompt text; 0 for absent/empty/non-string input. */
 export function estimateSystemTokens(text: unknown): number {
   if (typeof text !== 'string' || text.length === 0) return 0
   return Math.ceil(text.length / CHARS_PER_TOKEN) + ROLE_OVERHEAD
 }
 
-/**
- * Price a `system/message` payload's content exactly like the harness's
- * token-meter (`estimateSystemMessage`): text density over EVERY text block
- * plus role framing, with no per-block overhead — an adapter serializes the
- * prompt as plain text, so a text block costs its characters alone. Any other
- * block (or a hostile element) falls back to its JSON length. 0 for empty
- * content, which the harness reads as "no system prompt".
- */
+/** Price one text block exactly like the harness meter's text arm. */
+export function estimateTextTokens(text: string): number {
+  return Math.ceil(text.length / CHARS_PER_TOKEN) + BLOCK_OVERHEAD
+}
+
+/** Mirrors the harness's `estimateSystemMessage`: text density over every block plus role framing, no per-block overhead. */
 export function estimateSystemContent(blocks: unknown): number {
   if (!Array.isArray(blocks) || blocks.length === 0) return 0
   let characters = 0
@@ -38,7 +30,7 @@ export function estimateSystemContent(blocks: unknown): number {
       const json: unknown = JSON.stringify(block)
       if (typeof json === 'string') characters += json.length
     } catch {
-      // A cyclic/hostile block contributes no characters instead of throwing the fold.
+      // A cyclic/hostile block contributes nothing instead of throwing the fold.
     }
   }
   return Math.ceil(characters / CHARS_PER_TOKEN) + ROLE_OVERHEAD

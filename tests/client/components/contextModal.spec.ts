@@ -1,8 +1,3 @@
-// ContextModal (src/client/components/contextModal.tsx) — the /context
-// dialog rendered through the REGISTERED composition (makeContextModal over
-// a TestClientCtx), with the per-session modal store driving open/close,
-// real sessions faces for the consume-token bail, and real projections.
-
 import { act, createElement as h, useSyncExternalStore } from 'react'
 import assert from 'node:assert/strict'
 import { afterEach, describe, test, vi } from 'vitest'
@@ -33,7 +28,6 @@ function timeline(over: Record<string, unknown> = {}): ContextTimeline {
   } as ContextTimeline
 }
 
-/** A useContextModal hook really bound to the per-session store. */
 function boundModalHook(sessionId: string) {
   const store = modalStoreOf(sessionId)
   return (sel: (open: boolean) => boolean): boolean =>
@@ -46,8 +40,7 @@ afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   // The cold-start share (timelineSource.ts) is page-lifetime per session:
-  // drop it so one test's cold read never leaks its state into a later test
-  // that reuses the same session id.
+  // drop it so one test's cold read never leaks its state into a later test that reuses the same session id.
   resetTimelineDetailStores()
 })
 
@@ -129,6 +122,7 @@ describe('ContextModal', () => {
       contextTimeline: timeline({
         model: 'deepseek-v4-flash',
         provider: 'deepseek',
+        reasoningEffort: 'high',
       }),
       contextPressure: { projectedTokens: 100, contextWindow: 128000 },
       contextBreakdown: { systemTokens: 1, toolsTokens: 2, messageTokens: 18 },
@@ -141,9 +135,8 @@ describe('ContextModal', () => {
       useContextModal: OPEN,
       useProjection: (key: string) => projections[key],
     }))
-    assert.ok(text(m.container).includes('deepseek-v4-flash · deepseek'))
+    assert.ok(text(m.container).includes('deepseek · deepseek-v4-flash (high)'))
 
-    // Hovering a composition segment flows into hoverCat (dim + legend chip).
     const compCard = query(m.container, '.lc-modal-card .lc-card')
     const seg = query(compCard, '.lc-stacked-seg')
     await hover(seg)
@@ -219,7 +212,6 @@ describe('ContextModal', () => {
     assert.equal(sessions.bails.length, 1)
     assert.equal(sessions.bails[0].event, 'slash/input-consume-token')
     assert.deepEqual(sessions.bails[0].payload, { guard: { kind: 'bare-token', token: '/context' } })
-    // The guard was taken, not left behind.
     assert.equal(takePendingConsume(sid), undefined)
     await m.unmount()
   })
@@ -282,7 +274,8 @@ describe('ContextModal', () => {
     await m.unmount()
   })
 
-  test('the mask docks beside the frame ancestor, follows template rewrites, and disconnects on close', async () => {
+  test('the mask docks between the frame sidebars, follows template rewrites, and disconnects on close', async () => {
+    vi.stubGlobal('innerWidth', 1280)
     const sessions = new TestSessions()
     const ctx = new TestClientCtx({ services: { sessions } })
     const ContextModal = makeContextModal(asClientCtx(ctx), kit, settings)
@@ -290,7 +283,7 @@ describe('ContextModal', () => {
     // The shell frame: the plugin matches its INLINE grid template, the one
     // host anchor carried by every supported baseline (dockMeasure.ts).
     const frame = document.createElement('div')
-    frame.style.gridTemplateColumns = '280px minmax(0, 1fr) 360px'
+    frame.style.gridTemplateColumns = '280px minmax(400px, 1fr) minmax(0px, 360px)'
     const seat = document.createElement('div')
     frame.appendChild(seat)
     document.body.appendChild(frame)
@@ -301,20 +294,22 @@ describe('ContextModal', () => {
       useContextModal: boundModalHook(sid),
       useProjection: () => undefined,
     }))
-    // Relocate the mount container under the frame before opening, so the
-    // measure walks the real ancestor chain.
+    // Relocate the mount container under the frame before opening, so the measure walks the real ancestor chain.
     seat.appendChild(m.container)
     await act(async () => {
       modalStoreOf(sid).set(true)
     })
-    assert.equal(query(m.container, '.lc-modal-backdrop').style.left, '280px')
+    const backdrop = query(m.container, '.lc-modal-backdrop')
+    assert.equal(backdrop.style.left, '280px')
+    assert.equal(backdrop.style.right, '360px')
 
-    // A sidebar collapse rewrite while open is followed through the observer.
     await act(async () => {
-      frame.style.gridTemplateColumns = '56px minmax(0, 1fr) 360px'
+      frame.style.gridTemplateColumns = '56px minmax(0px, 1fr) minmax(0px, 0px)'
     })
     await flush()
-    assert.equal(query(m.container, '.lc-modal-backdrop').style.left, '56px')
+    const rewritten = query(m.container, '.lc-modal-backdrop')
+    assert.equal(rewritten.style.left, '56px')
+    assert.equal(rewritten.style.right, '0px')
 
     disconnectSpy.mockClear()
     await click(query(m.container, '.lc-modal-backdrop'))
@@ -332,7 +327,9 @@ describe('ContextModal', () => {
       useContextModal: OPEN,
       useProjection: () => undefined,
     }))
-    assert.equal(query(m.container, '.lc-modal-backdrop').style.left, '0px')
+    const backdrop = query(m.container, '.lc-modal-backdrop')
+    assert.equal(backdrop.style.left, '0px')
+    assert.equal(backdrop.style.right, '0px')
     await m.unmount()
   })
 
@@ -463,23 +460,66 @@ describe('ContextModal — the split generation', () => {
       useContextModal: OPEN,
       useProjection: (key: string) => (key === 'contextTimeline' ? head : undefined),
     }))
-    // The composition card paints off the head while the browser's detail note shows.
     assert.ok(text(m.container).includes(DICT_EN['overview.title']))
     assert.ok(text(m.container).includes(DICT_EN['detail.loading']))
-    // The detail lands: the browser serves the step picker + the sections.
     await until(() => !text(m.container).includes(DICT_EN['detail.loading']), 'the modal detail never landed')
     assert.equal(queryAll(m.container, '.lc-br-pick option').length, 2, 'live + the one served step')
     assert.ok(text(m.container).includes('1 Item'), 'the assistant section counts the served node')
     await m.unmount()
   })
 
+  test('a subagent message reads its full body under the durable parent address (issue #193)', async () => {
+    const calls: unknown[] = []
+    const ctx = new TestClientCtx({
+      services: {
+        sessions: { subagentAddress: () => ({ parentSessionId: 'sm-parent', childSessionId: 'sm-body', mode: 'continuable' }) },
+      },
+    })
+    ctx.setService('remote.session', { get page() { throw new Error('cannot get property "remote.session" without inject') } })
+    ctx.setService('remote', {
+      session: {
+        page: (request: unknown) => {
+          calls.push(request)
+          return Promise.resolve({
+            ok: true,
+            value: {
+              records: [{
+                type: 'event',
+                event: { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: 'OLD FULL BODY' }] } },
+              }],
+            },
+          })
+        },
+      },
+    })
+    watchHistoryFaces(asClientCtx(ctx))
+    const ContextModal = makeContextModal(asClientCtx(ctx), kit, settings)
+    const m = await mount(h(ContextModal, {
+      sessionId: 'sm-body',
+      useContextModal: OPEN,
+      useProjection: (key: string) => (key === 'contextTimeline'
+        ? timeline({ nodes: [{ seq: 1, cat: 'user', tokens: 5, text: 'old msg' }] })
+        : undefined),
+    }))
+    const userRow = queryAll(m.container, '.lc-br-cat-row').find(r => text(r).includes(DICT_EN['cat.user']))
+    assert.ok(userRow !== undefined)
+    await click(userRow)
+    await flush()
+    assert.deepEqual(calls, [{
+      address: { kind: 'subagent', parentSessionId: 'sm-parent', childSessionId: 'sm-body', mode: 'continuable' },
+      throughSeq: 1,
+      beforeSeq: 2,
+    }])
+    assert.ok(text(m.container).includes('OLD FULL BODY'), 'the fetched body renders')
+    await m.unmount()
+    ctx.dispose()
+  })
+
   test('a mount that raced the declared inject heals when the face lands mid-open', async () => {
-    // The race: the modal mounts (and its fetchers snapshot the face) BEFORE
-    // `remote` composes — the degraded note shows — then the inject fires and
-    // the OPEN system section must auto-fetch without any user action.
+    // The race: the modal mounts and its fetchers snapshot the face BEFORE `remote` composes, so the
+    // degraded note shows; when the inject fires, the open system section must auto-fetch.
     const calls: { sessionId: string; throughSeq: number; beforeSeq: number }[] = []
     const ctx = new TestClientCtx({ services: { sessions: new TestSessions() } })
-    // Armed before either service exists: the inject stays pending, the race.
     watchHistoryFaces(asClientCtx(ctx))
     const ContextModal = makeContextModal(asClientCtx(ctx), kit, settings)
     const projections: Record<string, unknown> = {
@@ -496,10 +536,7 @@ describe('ContextModal — the split generation', () => {
     await click(sysRow)
     assert.ok(text(m.container).includes(DICT_EN['browser.headerMetaOnly']), 'the faceless mount shows the static note')
 
-    // The face lands mid-open (cordis replays the pending inject): the modal
-    // re-renders, the fetcher builds, and the open epoch fetches by itself.
-    // The face rides INSIDE the `remote` facade; the `remote.session` service
-    // key stays hostile, as on the real host.
+    // The face rides INSIDE the `remote` facade; the `remote.session` service key stays hostile.
     await act(async () => {
       ctx.setService('remote.session', { get page() { throw new Error('cannot get property "remote.session" without inject') } })
       ctx.setService('remote', {
@@ -520,7 +557,6 @@ describe('ContextModal — the split generation', () => {
     assert.ok(!text(m.container).includes(DICT_EN['browser.headerMetaOnly']))
     assert.deepEqual(calls, [{ sessionId: 'sm-race', throughSeq: 1, beforeSeq: 2 }])
     await m.unmount()
-    // Unload the declared slot so no face stales into the next test.
     ctx.dispose()
   })
 })

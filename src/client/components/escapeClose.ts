@@ -1,20 +1,9 @@
-/**
- * The shared Escape-to-close contract of the plugin's overlays (the /context
- * modal and the baseline-gate dialog): capture-phase keydown on window, so
- * the composer's own key handling never swallows Escape first; on close, focus
- * returns to the element that held it when the overlay opened (skipped when
- * that element left the document).
- */
+/** Escape-to-close overlays: capture-phase keydown so the harness's bubble-phase Escape routing never sees the key. */
 
 import { useEffect, useRef } from 'react'
+import { isBareEscape, isClearableField, ownsClearEscape } from './clearableInput'
 
-/**
- * Close on Escape while `active`; restores the pre-open focus on cleanup.
- * `onClose` rides a latest-ref so the subscription lives on the `active`
- * transitions alone: every caller passes a render-fresh closure, and a
- * per-render resubscribe would rerun the cleanup's focus restore — yanking
- * focus out of the overlay's own inputs on every keystroke.
- */
+/** `onClose` rides a latest ref: a per-render resubscribe would rerun cleanup's focus restore and yank focus from overlay inputs. */
 export function useEscapeClose(active: boolean, onClose: () => void): void {
   const close = useRef(onClose)
   close.current = onClose
@@ -22,7 +11,14 @@ export function useEscapeClose(active: boolean, onClose: () => void): void {
     if (!active) return undefined
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null
     const onKey = (ev: KeyboardEvent): void => {
-      if (ev.key !== 'Escape') return
+      if (!isBareEscape(ev)) return
+      /* A focused clearable field keeps Escape away from the overlay: it clears when it has content, and
+         during IME composition the key stays with the IME while the overlay holds still. */
+      const target = ev.target
+      if (isClearableField(target) && (ev.isComposing || ownsClearEscape(target))) {
+        if (ev.isComposing) ev.stopPropagation()
+        return
+      }
       ev.preventDefault()
       ev.stopPropagation()
       close.current()

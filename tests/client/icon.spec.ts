@@ -1,11 +1,3 @@
-// The Context emblem (src/client/icon.tsx): the bundled document sheet that
-// fills the right-Sidebar tab type's two glyph seats — the guide capsule and
-// the chip title — in its polychrome default, plus the sidebar-foot entry
-// seat in the mono variant. Bundled rather than read off the harness
-// primitives, so these specs render the real component. The same sheet is
-// exported statically as the package-root icon.svg the Host's package-meta
-// reader serves to the Plugins page; a spec pins the two in lockstep.
-
 import { readFile } from 'node:fs/promises'
 import { createElement as h } from 'react'
 import assert from 'node:assert/strict'
@@ -22,7 +14,6 @@ describe('ContextIcon', () => {
     assert.equal(svg.getAttribute('viewBox'), '0 0 1024 1024')
     assert.equal(svg.getAttribute('class'), 'lc-title-icon')
     assert.equal(svg.getAttribute('aria-hidden'), 'true')
-    // Every stroke carries its own fixed fill — the sheet stays polychrome.
     const paths = queryAll<SVGPathElement>(m.container, 'path')
     assert.equal(paths.length, 10)
     const fills = paths.map(p => p.getAttribute('fill'))
@@ -40,19 +31,41 @@ describe('ContextIcon', () => {
     await m.unmount()
   })
 
-  test('the mono seat trades every palette fill for the current colour', async () => {
+  test('the mono seat inks the sheet in the current colour at the harness line weight', async () => {
     const m = await mount(h(ContextIcon, { mono: true }))
-    const paths = queryAll<SVGPathElement>(m.container, 'path')
-    assert.equal(paths.length, 10)
-    const fills = paths.map(p => p.getAttribute('fill'))
-    assert.ok(fills.every(f => f === 'currentColor'))
+    const svg = query<SVGSVGElement>(m.container, 'svg')
+    assert.equal(svg.innerHTML.match(/fill="#[0-9A-Fa-f]{6}"/g), null, 'no palette fill survives')
+    const rects = queryAll<SVGRectElement>(m.container, 'rect')
+    assert.equal(
+      rects.filter(r => r.getAttribute('fill') === 'currentColor').length,
+      1,
+      'one current-colour shape carries the whole glyph',
+    )
+    assert.equal(queryAll<SVGPathElement>(m.container, 'path').length, 10)
+    const [hole, thin] = queryAll<SVGMaskElement>(m.container, 'mask')
+    assert.match(hole.id, /-hole$/)
+    assert.match(thin.id, /-thin$/)
+    const shifts = queryAll<SVGRectElement>(thin, 'rect').filter(r => r.getAttribute('fill') === '#000')
+    assert.deepEqual(shifts.map(r => r.getAttribute('transform')), [
+      'translate(17 0)', 'translate(-17 0)', 'translate(0 17)', 'translate(0 -17)',
+    ])
+    assert.ok(shifts.every(r => r.getAttribute('mask') === `url(#${hole.id})`))
     await m.unmount()
   })
 
+  test('emblem instances never share mask defs', async () => {
+    const a = await mount(h(ContextIcon, { mono: true }))
+    const b = await mount(h(ContextIcon, { mono: true }))
+    const idsOf = (m: { container: HTMLElement }): string[] =>
+      queryAll<SVGMaskElement>(m.container, 'mask').map(mask => mask.id)
+    const ids = [...idsOf(a), ...idsOf(b)]
+    assert.equal(new Set(ids).size, ids.length, 'a duplicate id would strand one emblem on the other defs')
+    await a.unmount()
+    await b.unmount()
+  })
+
   test('the package-root icon.svg stays in lockstep with the component', async () => {
-    // The static file is what the Host's package-meta reader serves to the
-    // Plugins page (package.json `icon`), so a component edit that skips the
-    // file — or a manual file edit that skips the component — fails here.
+    // The static file is what the Host's package-meta reader serves (`package.json` `icon`): component and file must move together.
     const raw = await readFile('icon.svg', 'utf8')
     const svgPaths = [...raw.matchAll(/<path d="([^"]+)" fill="([^"]+)"\/>/g)].map(([, d, fill]) => ({ d, fill }))
     const m = await mount(h(ContextIcon, {}))

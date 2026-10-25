@@ -1,145 +1,9 @@
-// The projection warm-up (src/host/backfill.ts) over the REAL cordis
-// context: the trigger route's gating (no connection, no registry — no
-// pass), the one-pass-per-process arm (either half landing first, later
-// route hits no-op), the deferred inject's service gating, the per-session
-// skip ladder (malformed, invisible, live, already fully served), the
-// cold-read → coldSnapshot fold path, per-session failure isolation with
-// the migration-refusal accounting (debug detail, one summary info), and
-// abort-on-dispose.
-
 import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { BACKFILL_ROUTE, watchActivityBackfill } from '../../src/host/backfill'
-
-/** Poll until the async run reaches a condition. */
-async function until<T>(read: () => T | undefined, message: string): Promise<T> {
-  for (let i = 0; i < 300; i++) {
-    const value = read()
-    if (value !== undefined) return value
-    await new Promise(resolve => setTimeout(resolve, 1))
-  }
-  assert.fail(message)
-}
-
-/** One captured route registration (the trigger half's observable). */
-interface RouteBox {
-  path?: string
-  fetch?: (request: Request) => Promise<Response>
-}
-
-/** Fire the captured trigger route (the client's dashboard-open POST). */
-async function trigger(route: RouteBox): Promise<Response> {
-  // The route half registers on cordis's deferred inject — settle first.
-  for (let i = 0; i < 300 && route.fetch === undefined; i++) {
-    await new Promise(resolve => setTimeout(resolve, 1))
-  }
-  assert.ok(route.fetch !== undefined, 'the backfill route registered')
-  return route.fetch(new Request(`http://dsh.test${BACKFILL_ROUTE}`, { method: 'POST' }))
-}
-
-/** One log line the tests capture off the ctx logger. */
-interface LogLine {
-  level: string
-  text: string
-}
-
-/** Capture the pass's log lines through the logger service's exporter sink. */
-function captureLogs(ctx: Context): LogLine[] {
-  const lines: LogLine[] = []
-  // Lift every source's threshold to debug: the default exporter drops
-  // warn/debug records before they reach the sink.
-  ctx.logger.exporter({
-    levels: { root: 3, 'dsh-context': 3 },
-    export(message) {
-      lines.push({ level: message.type, text: message.args.map(a => String(a)).join(' ') })
-    },
-  })
-  return lines
-}
-
-/**
- * One format-refusal face of the persistence seam. The format edge throws
- * `SessionFormatUnsupportedMigrationError`, but the seam translates it — with
- * the "source vN artifact remains unchanged (raw log: …)" suffix — into
- * `SessionFormatUnsupportedError` before the error escapes (issue #75): the
- * pass must classify BOTH faces as the same refusal.
- */
-function unsupportedFormatError(name: string): Error {
-  const error = new Error(
-    'subagent/descriptor 0 uses unsupported descriptor version 2'
-    + '; source v0 artifact remains unchanged (raw log: C:\\Users\\u\\.dsh\\sessions\\log.jsonl.zstd)',
-  )
-  error.name = name
-  return error
-}
-
-/** A connection face whose route registration lands in `route`. */
-function connectionOf(route: RouteBox): unknown {
-  return {
-    fetch: {
-      register: (r: { path: string; fetch: RouteBox['fetch'] }) => {
-        route.path = r.path
-        route.fetch = r.fetch
-        return () => {}
-      },
-    },
-  }
-}
-
-interface FakeState {
-  listed: unknown
-  served: Set<string>
-  live: Set<string>
-  coldReads: string[]
-  coldSnapshots: string[]
-  failReads: Map<string, unknown>
-}
-
-function arm(ctx: Context, state: FakeState): RouteBox {
-  const route: RouteBox = {}
-  ctx.provide('connection', connectionOf(route))
-  ctx.provide('sessionQuery', {
-    listSessions: async () => state.listed,
-  })
-  ctx.provide('sessionProjectionCache', {
-    cachedSnapshot: (header: { id: string }) =>
-      state.served.has(header.id)
-        ? { asOfSeq: 0, values: { contextActivity: { days: {} }, contextTimeline: { ok: true } } }
-        : undefined,
-    coldSnapshot: (header: { id: string }) => {
-      state.coldSnapshots.push(header.id)
-      return { asOfSeq: 0, values: {} }
-    },
-  })
-  ctx.provide('sessionPersistence', {
-    open: async (id: string) => {
-      state.coldReads.push(id)
-      if (state.failReads.has(id)) throw state.failReads.get(id)
-      const events: SessionEvent[] = []
-      return {
-        header: { id, version: 1, createdAt: 1, cwd: '/repo', isSeeded: false },
-        inheritedEventCount: 0,
-        read: async () => ({ events }),
-        close: async () => {},
-      }
-    },
-  })
-  ctx.provide('sessions', { get: (id: string) => (state.live.has(id) ? { id } : undefined) })
-  return route
-}
-
-function fakeState(listed: unknown): FakeState {
-  return {
-    listed,
-    served: new Set(),
-    live: new Set(),
-    coldReads: [],
-    coldSnapshots: [],
-    failReads: new Map(),
-  }
-}
+import { arm, captureLogs, connectionOf, fakeState, trigger, unsupportedFormatError, until } from './helpers/backfill'
+import type { RouteBox } from './helpers/backfill'
 
 describe('watchActivityBackfill', () => {
   test('a deployment without any service never fires either half', async () => {
@@ -227,8 +91,7 @@ describe('watchActivityBackfill', () => {
     await new Promise(resolve => setTimeout(resolve, 20))
     assert.deepEqual(state.coldReads, [], 'the armed request holds until the faces complete')
 
-    // Re-arm the same face-shaped hole twice more: the request may land
-    // before or after the broken face — the re-proof answers either way.
+    // Re-arm the same face-shaped hole twice more: the request may land before or after the broken face.
     for (const broken of [
       { sessionProjectionCache: { coldSnapshot: () => ({}) } },
       { sessionPersistence: { notOpen: true } },
@@ -284,26 +147,20 @@ describe('watchActivityBackfill', () => {
     assert.deepEqual(state.coldSnapshots, [])
   })
 
-  test('the 0.1.7 face answers when the 3-arg spelling throws (the rc.2 cachedSnapshot signature)', async () => {
-    // dsh 0.1.7-rc.2 dropped the probe's offset parameter: a 3-arg call binds
-    // the branded offset onto `keys`, where `new Set(0)` throws as soon as a
-    // served record is reached. The probe must fall through to the newer
-    // 2-arg face instead of reading every served session as "not served".
+  test('the cached-rows probe rides the 2-arg face (header + keys)', async () => {
+    // The projection cache's `cachedSnapshot(meta, keys?)`: the lifecycle identity rides the header alone.
     const ctx = new Context()
     const state = fakeState([{ header: { id: 'a', cwd: '/repo/a' } }])
-    const arities: number[] = []
+    const calls: number[] = []
     const route: RouteBox = {}
     ctx.provide('connection', connectionOf(route))
     ctx.provide('sessionQuery', {
-      listSessions: async () => {
-        arities.push(0)
-        return state.listed
-      },
+      listSessions: async () => state.listed,
     })
     ctx.provide('sessionProjectionCache', {
-      cachedSnapshot: (header: { id: string }, offsetOrKeys: unknown, keys?: unknown) => {
-        arities.push(keys === undefined ? 2 : 3)
-        if (keys !== undefined) throw new TypeError('offset is not iterable')
+      cachedSnapshot: (header: { id: string }, keys?: unknown) => {
+        calls.push(1)
+        assert.ok(Array.isArray(keys), 'the probe passes the keys as the second argument')
         return header.id === 'a'
           ? { asOfSeq: 0, values: { contextActivity: { days: {} }, contextTimeline: { ok: true } } }
           : undefined
@@ -317,12 +174,11 @@ describe('watchActivityBackfill', () => {
     ctx.provide('sessions', { get: () => undefined })
     const dispose = watchActivityBackfill(ctx)
     await trigger(route)
-    await until(() => (arities.length > 0 ? true : undefined), 'the corpus was queried')
+    await until(() => (calls.length > 0 ? true : undefined), 'the corpus was queried')
     await new Promise(resolve => setTimeout(resolve, 40))
     dispose()
-    assert.deepEqual(state.coldReads, [], 'the newer face served the rows — no cold read')
+    assert.deepEqual(state.coldReads, [], 'the served rows skip the cold read')
     assert.deepEqual(state.coldSnapshots, [])
-    assert.deepEqual([...new Set(arities)].sort(), [0, 2, 3], 'the 3-arg spelling was tried first, the 2-arg face answered')
   })
 
   test('a rejection landing AFTER abort skips the warn (the unload owns the silence)', async () => {
@@ -365,8 +221,7 @@ describe('watchActivityBackfill', () => {
     const route = arm(ctx, state)
     const dispose = watchActivityBackfill(ctx)
     await trigger(route)
-    // The skip-guard records come first, so every guard branch runs before
-    // the two folds complete the observable signal; the run then finishes.
+    // The skip-guard records come first, so every guard branch runs before the two folds complete the signal.
     await until(() => (state.coldSnapshots.length >= 2 ? true : undefined), 'two cold folds')
     await new Promise(resolve => setTimeout(resolve, 60))
     dispose()
@@ -375,9 +230,8 @@ describe('watchActivityBackfill', () => {
   })
 
   test('a session serving only the activity row (timeline version-stale) gets a cold refold', async () => {
-    // The lastUser bump's whole point: a cached timeline row that predates
-    // the field fails the version gate and reads as absent — the session is
-    // NOT "already served" and its rows are rebuilt on the pass.
+    // The lastUser bump's whole point: a cached timeline row that predates the field fails the version gate and
+    // reads as absent — the session is NOT "already served" and is rebuilt on the pass.
     const ctx = new Context()
     const state = fakeState([{ header: { id: 'a', cwd: '/repo/a' } }])
     const route: RouteBox = {}
@@ -485,9 +339,8 @@ describe('watchActivityBackfill', () => {
       { header: { id: 'legacy-2', cwd: '/repo/legacy-2' } },
       { header: { id: 'good', cwd: '/repo/good' } },
     ])
-    // One refusal per face of the seam's translation: the translated name a
-    // real dsh delivers, and the untranslated format-edge name (either may
-    // arrive) — both classify alike, one summary for the pair.
+    // One refusal per face of the seam's translation: the translated name real dsh delivers and the untranslated
+    // format-edge name — both classify alike, one summary for the pair.
     state.failReads.set('legacy-1', unsupportedFormatError('SessionFormatUnsupportedError'))
     state.failReads.set('legacy-2', unsupportedFormatError('SessionFormatUnsupportedMigrationError'))
     const route = arm(ctx, state)
@@ -619,8 +472,6 @@ describe('watchActivityBackfill', () => {
     ctx.provide('connection', connectionOf(route))
     const dispose = watchActivityBackfill(ctx)
     await trigger(route)
-    // The request landed while only the route half existed; the faces land
-    // now and the pass must still run.
     ctx.provide('sessionQuery', { listSessions: async () => state.listed })
     ctx.provide('sessionProjectionCache', {
       cachedSnapshot: () => undefined,
@@ -739,4 +590,47 @@ describe('watchActivityBackfill', () => {
     await new Promise(resolve => setTimeout(resolve, 30))
     dispose()
   })
+
+  test('every cold read runs through the shared gate, and a skip stops the pass early', async () => {
+    const ctx = new Context()
+    const state = fakeState([
+      { header: { id: 'a', cwd: '/repo/a' } },
+      { header: { id: 'b', cwd: '/repo/b' } },
+      { header: { id: 'c', cwd: '/repo/c' } },
+    ])
+    const route = arm(ctx, state)
+    const lines = captureLogs(ctx)
+    let admitted = 0
+    const dispose = watchActivityBackfill(ctx, {
+      // The first read runs; every later one is skipped (the heap-pressure answer).
+      admit: <T>(read: () => Promise<T>): Promise<T | undefined> => {
+        admitted++
+        return admitted === 1 ? read() : Promise.resolve(undefined)
+      },
+    })
+    await trigger(route)
+    await until(() => (lines.some(l => l.text.includes('heap pressure')) ? true : undefined), 'the early-stop line')
+    await new Promise(resolve => setTimeout(resolve, 40))
+    dispose()
+    assert.deepEqual(state.coldReads, ['a'], 'the pass stopped at the first skip')
+    assert.deepEqual(state.coldSnapshots, ['a'], 'the folded session kept its row')
+    assert.equal(admitted, 2, 'one run plus one skip — the loop did not hammer the gate')
+    assert.ok(lines.some(l => l.level === 'info' && l.text.includes('backfilled for 1 session(s)')), 'the folded count still reports')
+    assert.ok(lines.some(l => l.level === 'info' && l.text.includes('stopped early under heap pressure')), 'the early stop reports once')
+  })
+
+  test('a pass admitted under pressure from the start folds nothing and says so', async () => {
+    const ctx = new Context()
+    const state = fakeState([{ header: { id: 'a', cwd: '/repo/a' } }])
+    const route = arm(ctx, state)
+    const lines = captureLogs(ctx)
+    const dispose = watchActivityBackfill(ctx, { admit: () => Promise.resolve(undefined) })
+    await trigger(route)
+    await until(() => (lines.some(l => l.text.includes('heap pressure')) ? true : undefined), 'the early-stop line')
+    await new Promise(resolve => setTimeout(resolve, 20))
+    dispose()
+    assert.deepEqual(state.coldReads, [], 'nothing was read')
+    assert.equal(lines.filter(l => l.text.includes('heap pressure')).length, 1, 'one line, not one per session')
+  })
 })
+

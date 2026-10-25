@@ -1,47 +1,23 @@
-/**
- * The plugin's user-settings binding (browser half). The Host-served
- * `dsh-context` namespace carries per-user display preferences; the Context
- * tab reads them at mount, and the Plugin configuration card (Settings →
- * Plugins) writes them through the settings scope. Both degrade to the
- * schema defaults when the settings surface is absent (older host) or
- * read-only (remote browser in memory mode).
- *
- * The scope faces are minimally re-typed here (the services.ts discipline):
- * the runtime service comes from the user's harness, and type-only imports
- * of the contract package would still be erased — spelling the consumed
- * members keeps the dependency graph honest.
- */
+import type { DefaultDeltaBase, DefaultFileSort, DefaultGranularity, DefaultDurationCurve, DefaultOverviewRange, DefaultPlacement, DefaultToolSort, DefaultTrendMode, FleetTab, InsightsEntry, OverviewAutoSteps, SettingsField } from '../shared/types'
 
-import type { DefaultDeltaBase, DefaultFileSort, DefaultGranularity, DefaultPlacement, DefaultToolSort, DefaultTrendMode, InsightsEntry, SettingsField } from '../shared/types'
+export type { DefaultDeltaBase, DefaultFileSort, DefaultToolSort, SettingsField } from '../shared/types'
 
-// The preference vocabulary is declared once in shared/types.ts; re-exported
-// here so client-side consumers keep their canonical import path.
-export type { DefaultDeltaBase, DefaultFileSort, DefaultGranularity, DefaultPlacement, DefaultToolSort, DefaultTrendMode, InsightsEntry, SettingsField } from '../shared/types'
+export function overviewThresholdOf(value: OverviewAutoSteps): number | null {
+  return value === 'off' ? null : Number(value)
+}
 
-/** The bound settings scope (ctx.settingsScope.bind result), as consumed. */
 export interface SettingsScopeLike {
   getSnapshot(): { status: string; value: unknown; writable: boolean }
   subscribe(listener: () => void): () => void
   set(field: string, value: unknown): Promise<void>
 }
 
-/** The ctx.settingsScope binder face, as consumed. */
-export interface SettingsScopeBinderFace {
-  bind(spec: { namespace: string }): SettingsScopeLike
-}
-
-/**
- * The ctx.configForms service face (the Config-form generation's settings
- * transport), as consumed: forms bind per namespace, and `whileServed` keeps
- * a registration alive while the Host serves any of them. The bound form
- * satisfies {@link SettingsScopeLike} (same snapshot/subscribe/set shape).
- */
+/** The `ctx.configForms` service face, as consumed; the bound form satisfies {@link SettingsScopeLike}. */
 export interface ConfigFormsFace {
   get(namespace: string): SettingsScopeLike
   whileServed(namespaces: readonly string[], register: () => () => void): () => void
 }
 
-/** The preference snapshot the card renders and the view reads at mount. */
 export interface SettingsState {
   /** Scope sync: loading until the first Host section, unavailable when unserved. */
   status: 'loading' | 'ready' | 'unavailable'
@@ -52,6 +28,12 @@ export interface SettingsState {
   toolSort: DefaultToolSort
   fileSort: DefaultFileSort
   insightsEntry: InsightsEntry
+  durationCurve: DefaultDurationCurve
+  overviewAutoSteps: OverviewAutoSteps
+  overviewRange: DefaultOverviewRange
+  fleetTab: FleetTab
+  promptPrefix: string
+  promptSuffix: string
   writable: boolean
 }
 
@@ -65,6 +47,10 @@ export interface ContextSettings {
   defaultToolSort(): DefaultToolSort
   defaultFileSort(): DefaultFileSort
   insightsEntry(): InsightsEntry
+  defaultDurationCurve(): DefaultDurationCurve
+  overviewAutoSteps(): OverviewAutoSteps
+  defaultOverviewRange(): DefaultOverviewRange
+  fleetTab(): FleetTab
   attach(scope: SettingsScopeLike): () => void
   /** Persist one preference choice (local echo, then the fenced scope write). */
   set(field: SettingsField, value: string): void
@@ -78,46 +64,56 @@ type Prefs = {
   toolSort?: DefaultToolSort
   fileSort?: DefaultFileSort
   insightsEntry?: InsightsEntry
+  durationCurve?: DefaultDurationCurve
+  overviewAutoSteps?: OverviewAutoSteps
+  overviewRange?: DefaultOverviewRange
+  fleetTab?: FleetTab
+  promptPrefix?: string
+  promptSuffix?: string
 }
 
 function prefsOf(value: unknown): Prefs {
   if (value === null || typeof value !== 'object') return {}
   const v = value as Record<string, unknown>
   return {
-    ...(v.defaultPlacement === 'all' || v.defaultPlacement === 'tab' || v.defaultPlacement === 'sidebar' ? { placement: v.defaultPlacement } : {}),
+    ...(v.defaultPlacement === 'all' || v.defaultPlacement === 'tab' || v.defaultPlacement === 'sidebar' || v.defaultPlacement === 'hide' ? { placement: v.defaultPlacement } : {}),
     ...(v.defaultGranularity === 'step' || v.defaultGranularity === 'turn' ? { granularity: v.defaultGranularity } : {}),
     ...(v.defaultTrendMode === 'total' || v.defaultTrendMode === 'delta' ? { mode: v.defaultTrendMode } : {}),
     ...(v.defaultDeltaBase === 'step' || v.defaultDeltaBase === 'turn' ? { deltaBase: v.defaultDeltaBase } : {}),
     ...(v.defaultToolSort === 'size' || v.defaultToolSort === 'count' || v.defaultToolSort === 'name' ? { toolSort: v.defaultToolSort } : {}),
-    ...(v.defaultFileSort === 'count' || v.defaultFileSort === 'latest' || v.defaultFileSort === 'path' ? { fileSort: v.defaultFileSort } : {}),
+    ...(v.defaultFileSort === 'count' || v.defaultFileSort === 'lines' || v.defaultFileSort === 'latest' || v.defaultFileSort === 'path' || v.defaultFileSort === 'name' ? { fileSort: v.defaultFileSort } : {}),
     ...(v.insightsEntry === 'show' || v.insightsEntry === 'hide' ? { insightsEntry: v.insightsEntry } : {}),
+    ...(v.defaultDurationCurve === 'show' || v.defaultDurationCurve === 'hide' ? { durationCurve: v.defaultDurationCurve } : {}),
+    ...(v.overviewAutoSteps === '100' || v.overviewAutoSteps === '200' || v.overviewAutoSteps === '300' || v.overviewAutoSteps === 'off' ? { overviewAutoSteps: v.overviewAutoSteps } : {}),
+    ...(v.defaultOverviewRange === 'today' || v.defaultOverviewRange === '7d' || v.defaultOverviewRange === '30d' || v.defaultOverviewRange === 'all' ? { overviewRange: v.defaultOverviewRange } : {}),
+    ...(v.fleetTab === 'show' || v.fleetTab === 'hide' ? { fleetTab: v.fleetTab } : {}),
+    ...(typeof v.promptPrefix === 'string' ? { promptPrefix: v.promptPrefix } : {}),
+    ...(typeof v.promptSuffix === 'string' ? { promptSuffix: v.promptSuffix } : {}),
   }
 }
 
 export function createContextSettings(): ContextSettings {
-  let state: SettingsState = { status: 'loading', placement: 'all', granularity: 'step', mode: 'total', deltaBase: 'step', toolSort: 'count', fileSort: 'count', insightsEntry: 'show', writable: false }
+  let state: SettingsState = { status: 'loading', placement: 'all', granularity: 'step', mode: 'total', deltaBase: 'step', toolSort: 'count', fileSort: 'lines', insightsEntry: 'show', durationCurve: 'show', overviewAutoSteps: '200', overviewRange: '30d', fleetTab: 'show', promptPrefix: '', promptSuffix: '', writable: false }
   let scope: SettingsScopeLike | undefined
   const listeners = new Set<() => void>()
+  /** Every field is a scalar, so a shallow compare is the identity check; a new preference joins it automatically. */
+  const unchanged = (a: SettingsState, b: SettingsState): boolean =>
+    (Object.keys(b) as (keyof SettingsState)[]).every(key => a[key] === b[key])
   const publish = (next: SettingsState): void => {
-    if (next.status === state.status && next.placement === state.placement && next.granularity === state.granularity
-      && next.mode === state.mode && next.deltaBase === state.deltaBase && next.toolSort === state.toolSort
-      && next.fileSort === state.fileSort && next.insightsEntry === state.insightsEntry && next.writable === state.writable) return
+    if (unchanged(state, next)) return
     state = next
     for (const listener of listeners) listener()
   }
-  // Republish from the bound scope's current snapshot; the attach sync and
-  // the failed-write rollback share this one read. Returns the scope's valid
-  // placement and insights entry, if it carries them.
-  const sync = (bound: SettingsScopeLike): { placement?: DefaultPlacement; insightsEntry?: InsightsEntry } => {
+  const sync = (bound: SettingsScopeLike): { placement?: DefaultPlacement; insightsEntry?: InsightsEntry; fleetTab?: FleetTab } => {
     const snap = bound.getSnapshot()
-    const prefs = prefsOf(snap.value)
-    // Fail open: a config problem must never leave an entry hidden. A valid
-    // value wins; one the plugin cannot understand degrades to the field's
-    // default; a section without the field (older Host half) keeps the
-    // current state.
-    const raw = snap.value !== null && typeof snap.value === 'object'
-      ? snap.value as Record<string, unknown>
-      : undefined
+    // Bounded catch: a value throwing on property access keeps the current state instead of breaking the mirror's fan-out.
+    let prefs: Prefs = {}
+    let raw: Record<string, unknown> | undefined
+    try {
+      prefs = prefsOf(snap.value)
+      raw = snap.value !== null && typeof snap.value === 'object' ? snap.value as Record<string, unknown> : undefined
+    } catch { /* hostile value */ }
+    // Fail open: an unreadable value degrades to the field's default; a section missing the field keeps the current state.
     publish({
       status: snap.status === 'ready' || snap.status === 'unavailable' ? snap.status : 'loading',
       placement: prefs.placement ?? (raw?.defaultPlacement === undefined ? state.placement : 'all'),
@@ -127,9 +123,15 @@ export function createContextSettings(): ContextSettings {
       toolSort: prefs.toolSort ?? state.toolSort,
       fileSort: prefs.fileSort ?? state.fileSort,
       insightsEntry: prefs.insightsEntry ?? (raw?.insightsEntry === undefined ? state.insightsEntry : 'show'),
+      durationCurve: prefs.durationCurve ?? (raw?.defaultDurationCurve === undefined ? state.durationCurve : 'show'),
+      overviewAutoSteps: prefs.overviewAutoSteps ?? (raw?.overviewAutoSteps === undefined ? state.overviewAutoSteps : '200'),
+      overviewRange: prefs.overviewRange ?? (raw?.defaultOverviewRange === undefined ? state.overviewRange : '30d'),
+      fleetTab: prefs.fleetTab ?? (raw?.fleetTab === undefined ? state.fleetTab : 'show'),
+      promptPrefix: prefs.promptPrefix ?? (raw?.promptPrefix === undefined ? state.promptPrefix : ''),
+      promptSuffix: prefs.promptSuffix ?? (raw?.promptSuffix === undefined ? state.promptSuffix : ''),
       writable: snap.writable,
     })
-    return { placement: prefs.placement, insightsEntry: prefs.insightsEntry }
+    return { placement: prefs.placement, insightsEntry: prefs.insightsEntry, fleetTab: prefs.fleetTab }
   }
   return {
     store: {
@@ -146,31 +148,35 @@ export function createContextSettings(): ContextSettings {
     defaultToolSort: () => state.toolSort,
     defaultFileSort: () => state.fileSort,
     insightsEntry: () => state.insightsEntry,
+    defaultDurationCurve: () => state.durationCurve,
+    overviewAutoSteps: () => state.overviewAutoSteps,
+    defaultOverviewRange: () => state.overviewRange,
+    fleetTab: () => state.fleetTab,
     attach(bound) {
       scope = bound
       sync(bound)
-      return bound.subscribe(() => { sync(bound) })
+      const unsubscribe = bound.subscribe(() => { sync(bound) })
+      return () => {
+        unsubscribe()
+        // A set() after disposal must not write into a dead form.
+        if (scope === bound) scope = undefined
+      }
     },
     set(field, value) {
       publish({ ...state, ...prefsOf({ [field]: value }) })
-      // The scope write settles asynchronously and its promise REJECTS on a
-      // transport failure (dsh keeps only its internal queue tail fulfilled)
-      // — never let it float unhandled. Roll the optimistic echo back to the
-      // scope's truth; a refused (non-2xx) write needs nothing here, the
-      // scope's own recovery re-reads the Host and republishes via subscribe.
+      // The scope write's promise REJECTS on a transport failure (dsh keeps only its queue tail fulfilled),
+      // so never let it float: roll the optimistic echo back to the scope's truth; a refused write recovers via subscribe.
       const bound = scope
       if (bound === undefined) return
       void bound.set(field, value).catch(() => {
         const truth = sync(bound)
-        // A visibility gate that failed to persist must not keep an entry
-        // hidden on an unpersisted echo: with no valid value in the scope's
-        // truth, degrade each gate to its default.
-        if (field === 'defaultPlacement' && truth.placement === undefined) {
-          publish({ ...state, placement: 'all' })
-        }
-        if (field === 'insightsEntry' && truth.insightsEntry === undefined) {
-          publish({ ...state, insightsEntry: 'show' })
-        }
+        // A gate whose write was refused must not stay hidden on an unpersisted echo: it degrades to the
+        // default, while a scope that DOES carry a readable value keeps that truth (the sync above already did).
+        const refused: Partial<SettingsState> = {}
+        if (field === 'defaultPlacement' && truth.placement === undefined) refused.placement = 'all'
+        else if (field === 'insightsEntry' && truth.insightsEntry === undefined) refused.insightsEntry = 'show'
+        else if (field === 'fleetTab' && truth.fleetTab === undefined) refused.fleetTab = 'show'
+        if (Object.keys(refused).length > 0) publish({ ...state, ...refused })
       })
     },
   }

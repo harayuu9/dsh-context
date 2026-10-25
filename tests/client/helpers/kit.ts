@@ -1,21 +1,21 @@
-// Client test kit: real dictionaries, real React rendering, and a faithful
-// harness-context implementation (the documented cordis/locale/slots
-// contracts, not mocks of plugin code). Shared by every client spec so each
-// test file stays small and stateless.
-
 import { act, type ReactElement, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { DICT_EN, DICT_ZH } from '../../../src/client/i18n'
 import type { Translate } from '../../../src/client/i18n'
 import { makeViewKit, type ViewKit } from '../../../src/client/viewkit'
+import type { SurfaceNode } from '../../../src/shared/types'
 
-/**
- * The harness locale chain: active-locale dictionary → en → the key itself,
- * with `{name}` interpolation. Built over the plugin's REAL dictionaries, so
- * assertions exercise the shipped strings rather than a test copy.
- */
+export function surfaceNode(over: Partial<SurfaceNode> & { seq: number }): SurfaceNode {
+  return { cat: 'user', tokens: 5, ...over }
+}
+
+export function surfaceNodeAt(seq: number, over: Partial<SurfaceNode> = {}): SurfaceNode {
+  return { seq, cat: 'user', tokens: 1, ...over }
+}
+
+/** The harness locale chain (active → en → key) over the plugin's REAL dictionaries, so assertions stay shipped-accurate. */
 export function makeTranslate(active: 'en' | 'zh' = 'en', dicts?: Record<string, Record<string, string>>): Translate {
-  const table = dicts ?? { zh: DICT_ZH, en: DICT_EN }
+  const table: Record<string, Record<string, string>> = dicts ?? { zh: DICT_ZH, en: DICT_EN }
   return (key, params) => {
     let s = table[active]?.[key] ?? table.en[key] ?? key
     if (params) for (const k in params) s = s.replace('{' + k + '}', String(params[k]))
@@ -30,12 +30,10 @@ export function makeKit(active: 'en' | 'zh' = 'en'): ViewKit {
 export interface Mounted {
   container: HTMLElement
   root: Root
-  /** Re-render with new props (act-wrapped). */
   update(el: ReactElement): Promise<void>
   unmount(): Promise<void>
 }
 
-/** Mount a real React tree in jsdom, effects flushed through act. */
 export async function mount(el: ReactElement): Promise<Mounted> {
   const container = document.createElement('div')
   document.body.appendChild(container)
@@ -60,18 +58,12 @@ export async function mount(el: ReactElement): Promise<Mounted> {
   }
 }
 
-/** Flush pending promises/effects (image loads, deferred setState). */
 export async function flush(): Promise<void> {
   await act(async () => {})
 }
 
-/**
- * Poll until the predicate holds, one short act() scope per tick: timers and
- * promise chains only get to run while a scope's sleep is awaiting, so the
- * state updates they land are act-attributed (no React act() warnings) and
- * committed when the scope exits — the check between ticks sees them. Real
- * timers ride the store's own debounce; `message` labels the give-up failure.
- */
+/** Poll until the predicate holds, one short act() scope per tick, so timer/promise updates are
+ * act-attributed and committed before the next check. `message` labels the give-up failure. */
 export async function until(fn: () => boolean, message: string): Promise<void> {
   for (let i = 0; i < 400; i++) {
     await act(async () => {
@@ -83,13 +75,8 @@ export async function until(fn: () => boolean, message: string): Promise<void> {
   throw new Error(message)
 }
 
-/**
- * Silence a deliberately-thrown render error: React 18 dev replays a failed
- * render through a fake DOM event, which jsdom reports as an uncaught window
- * error and vitest forwards to an uncaughtException — a user error listener
- * that prevents the default keeps the throw inside the test. Returns the
- * cleanup that restores normal error reporting.
- */
+/** Silence a deliberately-thrown render error: React 18 dev replays it as a fake DOM event jsdom reports as
+ * uncaught; preventing the default keeps the throw inside the test. */
 export function silenceWindowErrors(): () => void {
   const onError = (e: Event) => { e.preventDefault() }
   window.addEventListener('error', onError)
@@ -98,6 +85,12 @@ export function silenceWindowErrors(): () => void {
 
 export function text(container: HTMLElement): string {
   return container.textContent ?? ''
+}
+
+/** The composition bar's tooltip rows, so specs assert the bubble's structure instead of textContent. */
+export function tipRows(tip: HTMLElement): (string | null)[] {
+  return ['.lc-bar-tip-head', '.lc-bar-tip-fig', '.lc-bar-tip-note']
+    .map(sel => tip.querySelector<HTMLElement>(sel)?.textContent ?? null)
 }
 
 export function query<T extends Element = HTMLElement>(container: ParentNode, selector: string): T {
@@ -110,18 +103,30 @@ export function queryAll<T extends Element = HTMLElement>(container: ParentNode,
   return [...container.querySelectorAll<T>(selector)]
 }
 
-/** Click through act so React processes the dispatch synchronously. */
+/** Pin a jsdom element's boxes: jsdom lays nothing out, so measuring components need geometry. */
+export function pinRect(el: Element, width: number, height = 0): void {
+  Object.defineProperty(el, 'getBoundingClientRect', {
+    configurable: true,
+    value: () => ({ left: 0, top: 0, width, height, right: width, bottom: height }),
+  })
+}
+
 export async function click(el: HTMLElement): Promise<void> {
   await act(async () => {
     el.click()
   })
 }
 
-/**
- * Pointer hover. React 18 synthesizes onMouseEnter/onMouseLeave from the
- * BUBBLING mouseover/mouseout pair — dispatching raw mouseenter/leave (they
- * do not bubble) never reaches React's handlers.
- */
+/** The native value setter plus the input event React's onChange listens for (a plain assignment is swallowed). */
+export async function typeText(el: HTMLTextAreaElement | HTMLInputElement, text: string): Promise<void> {
+  await act(async () => {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+    Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(el, text)
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+}
+
+/** React 18 synthesizes onMouseEnter/Leave from the BUBBLING mouseover/mouseout pair. */
 export async function hover(el: Element): Promise<void> {
   await act(async () => {
     el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }))
@@ -134,14 +139,41 @@ export async function unhover(el: Element): Promise<void> {
   })
 }
 
-/** Dispatch a real keydown (Escape etc.) on window, act-wrapped. */
+/** React synthesizes onFocus/onBlur from the BUBBLING focusin/focusout pair. */
+export async function focus(el: Element): Promise<void> {
+  await act(async () => {
+    el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+  })
+}
+
+export async function blur(el: Element): Promise<void> {
+  await act(async () => {
+    el.dispatchEvent(new FocusEvent('focusout', { bubbles: true }))
+  })
+}
+
 export async function keydown(key: string, target: HTMLElement | Window = window): Promise<void> {
   await act(async () => {
     target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }))
   })
 }
 
-/** Dispatch a real wheel gesture on an element and report whether a listener canceled it. */
+export async function press(
+  target: HTMLElement,
+  init: KeyboardEventInit,
+): Promise<{ ev: KeyboardEvent; reachedDocument: boolean }> {
+  let reachedDocument = false
+  const listener = (): void => { reachedDocument = true }
+  document.addEventListener('keydown', listener)
+  const ev = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init })
+  try {
+    await act(async () => { target.dispatchEvent(ev) })
+  } finally {
+    document.removeEventListener('keydown', listener)
+  }
+  return { ev, reachedDocument }
+}
+
 export function wheel(el: Element, deltaX: number, deltaY: number): boolean {
   const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaX, deltaY })
   el.dispatchEvent(event)

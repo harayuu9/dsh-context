@@ -1,48 +1,24 @@
-/**
- * The client's model-price book (client/cost.ts prices from it): the
- * models.dev registry, fetched through the official @opencode-ai/models
- * SDK. The registry payload is untrusted wire input, so `pricesBookOf`
- * re-proves every field at the boundary — a non-conforming provider/model/
- * cost entry drops whole. The book keeps EVERY provider that prices (keyed
- * by the registry's own provider id), so a dsh provider id outside the
- * rename table still prices by direct passthrough, and carries each
- * provider's `npm` package into the model-side resolution index
- * (cost.ts `priceIndexOf`) so unknown provider ids price by model id alone.
- * One fetch per page load, kicked on first subscribe; a failure degrades to
- * a visible state the cost cell notes, with a backed-off automatic retry —
- * never a spinner, and never an unhandled rejection.
- */
-
 import { Models } from '@opencode-ai/models'
 import { useSyncExternalStore } from 'react'
 import { asRecord } from './services'
 import { priceIndexOf } from './cost'
 import type { ModelBook, ModelPrices, PriceTriple } from './cost'
 
-/** One finite non-negative registry figure, or null. */
 function rateOf(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
 }
 
-/**
- * Extract the whole registry's per-model USD rates from a delivered
- * providers payload (`/api.json`), keyed by the registry's provider ids,
- * with the resolution index built over it. Any shape failure skips just
- * that entry; a payload that is not a record at all returns null (the store
- * treats it as a failed fetch and retries).
- */
+/** Extract the registry's per-model USD rates and build the resolution index; a non-record payload returns null (a failed fetch). */
 export function pricesBookOf(value: unknown): ModelBook | null {
   const data = asRecord(value)
   if (data === null || Array.isArray(data)) return null
   const book: ModelPrices = {}
-  const npmOf: Record<string, string | null> = {}
+  const canonicalOf: Record<string, Record<string, string>> = {}
   for (const providerId of Object.keys(data)) {
     const provider = asRecord(data[providerId])
     if (provider === null) continue
     const modelList = asRecord(provider.models)
     if (modelList === null) continue
-    const npm: unknown = provider.npm
-    npmOf[providerId] = typeof npm === 'string' ? npm : null
     const models: Record<string, PriceTriple> = {}
     for (const id of Object.keys(modelList)) {
       const model = asRecord(modelList[id])
@@ -57,17 +33,19 @@ export function pricesBookOf(value: unknown): ModelBook | null {
         write: rateOf(cost.cache_write) ?? miss,
         out,
       }
+      const canonical = model?.['canonical_model_id']
+      if (typeof canonical === 'string' && canonical.length > 0) {
+        const branch = canonicalOf[providerId] ?? (canonicalOf[providerId] = {})
+        branch[id] = canonical
+      }
     }
     if (Object.keys(models).length > 0) book[providerId] = models
   }
-  return { prices: book, index: priceIndexOf(book, npmOf) }
+  return { prices: book, index: priceIndexOf(book, canonicalOf) }
 }
 
-/** The store's observable snapshot, identity-stable between transitions. */
 export interface ModelPricesSnap {
-  /** The extracted book with its resolution index, null until the first successful fetch. */
   book: ModelBook | null
-  /** The last fetch failed (the cost cell notes the outage until a retry lands). */
   failed: boolean
 }
 
@@ -75,7 +53,6 @@ type Loader = () => Promise<unknown>
 
 const defaultLoader: Loader = () => Models.make().providers()
 
-/** The retry backoff base; each consecutive failure doubles the wait, capped at 3 doublings. */
 const RETRY_BASE_MS = 30_000
 
 let loader: Loader = defaultLoader
@@ -86,14 +63,13 @@ let timer: ReturnType<typeof setTimeout> | null = null
 const listeners = new Set<() => void>()
 
 function fail(): void {
-  // Single-arm invariant: fail() runs exactly once per fetch cycle (only
-  // fire() calls it, and both fire() callers — kick() and the timer
-  // callback — are blocked while a timer is armed), so re-arming here can
-  // never leak a timer.
+  // Runs once per fetch cycle: both fire() callers are blocked while a timer is armed, so re-arming cannot leak.
   snap = { ...snap, failed: true }
   failures++
   timer = setTimeout(() => {
     timer = null
+    // Nobody reads the book anymore: end the cycle instead of polling for the page's whole life.
+    if (listeners.size === 0) return
     void fire()
   }, RETRY_BASE_MS * 2 ** Math.min(failures - 1, 3))
 }
@@ -120,7 +96,6 @@ function kick(): void {
   void fire()
 }
 
-/** The useSyncExternalStore seam: subscribing also kicks the first fetch. */
 export const subscribeModelPrices = (fn: () => void): (() => void) => {
   listeners.add(fn)
   kick()
@@ -131,12 +106,10 @@ export const subscribeModelPrices = (fn: () => void): (() => void) => {
 
 export const getModelPricesSnap = (): ModelPricesSnap => snap
 
-/** The stats board's read of the price book (null until the fetch lands). */
 export function useModelPrices(): ModelPricesSnap {
   return useSyncExternalStore(subscribeModelPrices, getModelPricesSnap)
 }
 
-/** Test isolation: drop the book, the retry timer, and the listeners. */
 export function resetModelPrices(): void {
   if (timer !== null) {
     clearTimeout(timer)
@@ -148,7 +121,6 @@ export function resetModelPrices(): void {
   listeners.clear()
 }
 
-/** Test seam: replace the loader (the SDK fetch) with a stub; null restores the default. */
 export function setModelPricesLoader(next: Loader | null): void {
   loader = next ?? defaultLoader
 }

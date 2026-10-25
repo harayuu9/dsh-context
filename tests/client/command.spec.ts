@@ -1,8 +1,3 @@
-// The /context slash command (src/client/command.ts): soft service
-// dependency, trigger-source registration, candidates, pick, and enter
-// adjudication over a faithful harness ctx. Session ids are unique per test
-// so the module-level modal/consume state never leaks between cases.
-
 import assert from 'node:assert/strict'
 import { describe, test } from 'vitest'
 import { registerContextCommand } from '../../src/client/command'
@@ -15,7 +10,6 @@ import { makeKit } from './helpers/kit'
 
 type Source = Parameters<InputTriggersFace['registerSource']>[0]
 
-/** A real in-memory input-trigger face (registerSource records + disposes). */
 class TestInputTriggers {
   readonly sources: Source[] = []
 
@@ -46,9 +40,6 @@ describe('registerContextCommand', () => {
   })
 
   test('a service provided with a foreign shape registers nothing', () => {
-    // The inject callback fires on the service NAME; a value that is not a
-    // trigger face (a half-composed module, a producer drift) must degrade
-    // to the no-command state instead of throwing at apply.
     const ctx = new TestClientCtx({ services: { inputTriggers: { registerSource: 42 } } })
     registerContextCommand(asClientCtx(ctx), makeKit())
     ctx.dispose()
@@ -73,9 +64,6 @@ describe('candidates', () => {
   test('an empty query yields the context candidate', async () => {
     const { source } = setup()
     const candidates = await source.candidates({ sessionId: 'cmd-empty' }, { query: '', position: 'leading', signal: SIGNAL })
-    // The localized section replaces the menu's raw source-name title row;
-    // the localized label and glyph are display-only (older harness builds
-    // render the bare name).
     assert.deepEqual(candidates, [{
       name: 'context',
       label: DICT_EN['cmd.label'],
@@ -119,8 +107,6 @@ describe('onPick', () => {
 })
 
 describe('matchEnter', () => {
-  // The contract marks matchEnter optional; registerContextCommand always
-  // provides it, and the spec asserts that registration shape once.
   test('the bare /context line arms the bare-token guard, opens the modal, and answers handled', async () => {
     const { source } = setup()
     assert.ok(source.matchEnter, 'the /context source registers matchEnter')

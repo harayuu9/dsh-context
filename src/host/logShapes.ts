@@ -1,29 +1,8 @@
-/**
- * Shape-driven readers over the durable session-event vocabulary — the ONE
- * place the plugin's log spellings meet. The supported range (dsh
- * 0.1.5-rc.1+, session formats V3/V4) speaks ONE dialect:
- * `system/message` surface nodes, `assistant/message.data.stream` /
- * `assistant/attempt.data.stream` (packed delta runs plus raw chunk
- * records), `SurfaceOp { startSeq, endSeq }`, `tool/ptc-dispatch`.
- *
- * The fold still reads SHAPES, never a detected harness version: the raw log
- * is untrusted input at every layer, and the supported harness refuses —
- * never rewrites — a legacy-format log, so anything that reaches these
- * readers is current-dialect or hostile. Every reader is total over
- * untrusted input — a malformed record yields "nothing here", never a throw
- * (the projection registry drives the fold without an error boundary; one
- * throw stalls the unit's push feed and the browser waits on "loading"
- * forever).
- *
- * @module dsh-context/host/log-shapes
- */
+/** Shape-driven readers over the durable session-event vocabulary — the ONE place the plugin's log spellings meet. Readers stay total
+ * over untrusted input (the registry drives the fold with no error boundary), and the fold reads SHAPES, never a detected harness
+ * version. */
 
-/**
- * Whether one raw stream chunk carries a token delta — the first-token
- * marker, mirroring dsh-llm's `isTokenDelta` (a non-empty text or reasoning
- * fragment, or any Tool-call delta carrying arguments or a name); a
- * malformed chunk is simply not a token.
- */
+/** Whether a raw stream chunk carries a token delta; mirrors dsh-llm's `isTokenDelta`. */
 export function isTokenChunk(chunk: unknown): boolean {
   if (chunk === null || typeof chunk !== 'object') return false
   const c = chunk as { type?: unknown; text?: unknown; argumentsDelta?: unknown; name?: unknown }
@@ -38,15 +17,8 @@ export function isTokenChunk(chunk: unknown): boolean {
   }
 }
 
-/**
- * The decode bucket a stream's `block-start.blockType` names: the model's
- * thinking, the answer text, or the tool-call arguments. Undefined for an
- * unknown/hostile marker, whose interval then stays unattributed rather than
- * poisoning a bucket.
- */
 export type DecodeKind = 'reasoning' | 'text' | 'toolarg'
 
-/** Map one `blockType` to its timing bucket (see {@link DecodeKind}). */
 export function decodeKindOfBlock(blockType: unknown): DecodeKind | undefined {
   if (blockType === 'reasoning') return 'reasoning'
   if (blockType === 'text') return 'text'
@@ -54,57 +26,13 @@ export function decodeKindOfBlock(blockType: unknown): DecodeKind | undefined {
   return undefined
 }
 
-/** Per-kind decode spans (see {@link decodeTallyOfStream}). */
-export type DecodeSpans = Record<DecodeKind, number>
-
-/** Per-kind count of opened decode blocks (see {@link decodeTallyOfStream}). */
-export type DecodeCounts = Record<DecodeKind, number>
-
-/** Both decode tallies of one stream: the spans that price the split and the marker counts that qualify its rows. */
 export interface DecodeTally {
-  spans: DecodeSpans
-  blocks: DecodeCounts
+  spans: Record<DecodeKind, number>
+  blocks: Record<DecodeKind, number>
 }
 
-/**
- * Per-kind decode spans AND counted `block-start` markers inside one embedded
- * assistant stream, tiling [first block-start, endTime]: each `block-start`
- * record owns the interval up to the next one, the last one up to `endTime`.
- * Total over untrusted input — a malformed record is skipped whole (a
- * marker with an unusable time anchors no span and counts nothing), a
- * non-finite boundary yields zero, and a stream with no marker (or not an
- * array) yields all zeros.
- */
-export function decodeTallyOfStream(stream: unknown, endTime: number): DecodeTally {
-  const tally: DecodeTally = { spans: { reasoning: 0, text: 0, toolarg: 0 }, blocks: { reasoning: 0, text: 0, toolarg: 0 } }
-  if (!Array.isArray(stream) || !Number.isFinite(endTime)) return tally
-  let kind: DecodeKind | undefined
-  let since = 0
-  for (const record of stream) {
-    if (record === null || typeof record !== 'object') continue
-    const r = record as Record<string, unknown>
-    if (r.type !== 'chunk' || r.chunk === null || typeof r.chunk !== 'object') continue
-    const chunk = r.chunk as { type?: unknown; blockType?: unknown }
-    if (chunk.type !== 'block-start') continue
-    const time = r.time
-    if (typeof time !== 'number' || !Number.isFinite(time)) continue
-    if (kind !== undefined) tally.spans[kind] += Math.max(0, time - since)
-    kind = decodeKindOfBlock(chunk.blockType)
-    if (kind !== undefined) tally.blocks[kind] += 1
-    since = time
-  }
-  if (kind !== undefined) tally.spans[kind] += Math.max(0, endTime - since)
-  return tally
-}
-
-/**
- * The first token's instant inside one PACKED delta run (`text-chunks` /
- * `reasoning-chunks` / `tool-call-chunks`): the run's base time plus the
- * accumulated inter-member deltas, taken at the first qualifying member —
- * a name-bearing Tool-call run starts at its first member. Mirrors dsh-llm's
- * `runFirstTokenTime`; a non-finite base or delta yields undefined rather
- * than a NaN instant.
- */
+/** The first token's instant inside one PACKED delta run: base time plus accumulated inter-member deltas at the first qualifying member.
+ * Mirrors dsh-llm's `runFirstTokenTime`; a non-finite delta yields undefined. */
 function runFirstTokenTime(record: Record<string, unknown>): number | undefined {
   const time0 = record.time0
   if (typeof time0 !== 'number' || !Number.isFinite(time0)) return undefined
@@ -124,34 +52,68 @@ function runFirstTokenTime(record: Record<string, unknown>): number | undefined 
   return undefined
 }
 
-/**
- * The first token's instant inside an embedded assistant stream
- * (`assistant/message.data.stream`, `assistant/attempt.data.stream`), or
- * undefined when the stream carries no token. Mirrors dsh-llm's
- * `assistantStreamFirstTokenTime` over the compact record union.
- */
+export interface DecodeSpan {
+  kind: DecodeKind
+  start: number
+  end: number
+}
+
 export function firstTokenTimeOfStream(stream: unknown): number | undefined {
-  if (!Array.isArray(stream)) return undefined
+  // A NaN endTime disables the marker decode, leaving exactly the token scan.
+  return streamTimingOf(stream, Number.NaN).firstToken
+}
+
+/** Everything one assistant stream contributes to the metering. */
+export interface StreamTiming {
+  firstToken?: number
+  spans: DecodeSpan[]
+  tally: DecodeTally
+}
+
+export function streamTimingOf(stream: unknown, endTime: number): StreamTiming {
+  const tally: DecodeTally = { spans: { reasoning: 0, text: 0, toolarg: 0 }, blocks: { reasoning: 0, text: 0, toolarg: 0 } }
+  const spans: DecodeSpan[] = []
+  const result: StreamTiming = { spans, tally }
+  if (!Array.isArray(stream)) return result
+  // A non-finite endTime leaves the decode readings empty; the token scan is independent of it.
+  const markersReadable = Number.isFinite(endTime)
+  let firstToken: number | undefined
+  let kind: DecodeKind | undefined
+  let since = 0
+  const close = (to: number): void => {
+    if (kind === undefined || to <= since) return
+    spans.push({ kind, start: since, end: to })
+    tally.spans[kind] += to - since
+  }
   for (const record of stream) {
     if (record === null || typeof record !== 'object') continue
     const r = record as Record<string, unknown>
     if (r.type === 'chunk') {
+      const chunk = r.chunk !== null && typeof r.chunk === 'object' ? r.chunk as { type?: unknown; blockType?: unknown } : null
       const time = r.time
-      if (typeof time === 'number' && Number.isFinite(time) && isTokenChunk(r.chunk)) return time
+      if (!Number.isFinite(time)) continue
+      if (markersReadable && chunk !== null && chunk.type === 'block-start') {
+        close(time as number)
+        kind = decodeKindOfBlock(chunk.blockType)
+        if (kind !== undefined) tally.blocks[kind] += 1
+        since = time as number
+      } else if (firstToken === undefined && isTokenChunk(chunk)) {
+        firstToken = time as number
+      }
+      // A token-only read (no marker decode) is answered at the first token: nothing later can change it.
+      if (!markersReadable && firstToken !== undefined) break
       continue
     }
-    const time = runFirstTokenTime(r)
-    if (time !== undefined) return time
+    if (firstToken === undefined) firstToken = runFirstTokenTime(r)
+    if (!markersReadable && firstToken !== undefined) break
   }
-  return undefined
+  if (markersReadable) close(endTime)
+  if (firstToken !== undefined) result.firstToken = firstToken
+  return result
 }
 
-/**
- * The inclusive surface range a replacement op covers, or null for `append`
- * and for any unrecognized/hostile op (which the fold treats as an append).
- * The `startSeq`/`endSeq` endpoints are each accepted only as a finite
- * number, so a hostile op with one malformed endpoint degrades to append.
- */
+/** The inclusive surface range a replacement op covers, or null for `append` and any unrecognized/hostile op (which the fold treats as an
+ * append). */
 export function replaceRangeOf(surfaceOp: unknown): { start: number; end: number } | null {
   if (surfaceOp === null || typeof surfaceOp !== 'object') return null
   const op = surfaceOp as { op?: unknown; startSeq?: unknown; endSeq?: unknown }

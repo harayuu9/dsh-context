@@ -1,10 +1,3 @@
-// The client balance reader (src/client/balance.ts): the delivered payload's
-// boundary proof (hostile entries drop, a payload with no valid entry is no
-// balance), the display-currency pick with the account's first currency as
-// fallback, and the read that paints the remembered figure while one
-// background route read revalidates it — including every storage and
-// transport failure, which serve the remembered figure rather than a blank.
-
 import assert from 'node:assert/strict'
 import { afterEach, beforeEach, describe, test, vi } from 'vitest'
 import {
@@ -26,7 +19,6 @@ const WIRE_BALANCE = {
   ],
 }
 
-/** The CNY entry of a wire payload shaped like the route's. */
 function wire(total: number): { isAvailable: boolean; balances: { currency: string; total: number; granted: number; toppedUp: number }[] } {
   return { isAvailable: true, balances: [{ currency: 'CNY', total, granted: 0, toppedUp: total }] }
 }
@@ -42,7 +34,6 @@ function stubRoute(body: unknown | undefined, mode: 'ok' | 'reject' | 'status' =
   return { calls: () => n }
 }
 
-/** A route answer that lands when released, so a caller can inspect the pending state. */
 function gatedRoute(): { release: () => void; calls: () => number } {
   let release!: () => void
   const gate = new Promise<void>((resolve) => { release = resolve })
@@ -55,7 +46,6 @@ function gatedRoute(): { release: () => void; calls: () => number } {
   return { release, calls: () => n }
 }
 
-/** A storage double over a plain map, so absence, garbage, and refusal are all reachable. */
 class FakeStorage implements StorageFace {
   store = new Map<string, string>()
   constructor(seed?: Record<string, string>) {
@@ -72,30 +62,25 @@ class FakeStorage implements StorageFace {
   }
 }
 
-/** Drain the promise chains a pending route answer settles, then report. */
 async function drain(): Promise<void> {
   for (let i = 0; i < 8; i++) await Promise.resolve()
 }
 
-/** Collect the figures a read's background refresh reports. */
 function collector(): { seen: PlatformBalance[]; onRefresh: (v: PlatformBalance) => void } {
   const seen: PlatformBalance[] = []
   return { seen, onRefresh: (v) => seen.push(v) }
 }
 
-/** A storage double pre-seeded with the remembered figure, as the previous open left it. */
 function seededStorage(): FakeStorage {
   const fake = new FakeStorage({ [PLATFORM_BALANCE_STORAGE_KEY]: JSON.stringify(WIRE_BALANCE) })
   setPlatformBalanceStorage(fake)
   return fake
 }
 
-/** Clear the real storage the module falls back to; a refused getter has nothing to clear. */
 function clearRealStorage(): void {
   try {
     globalThis.localStorage.clear()
   } catch {
-    // A swapped-in refused getter: the next test restores the real one.
   }
 }
 

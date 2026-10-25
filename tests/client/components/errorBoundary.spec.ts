@@ -1,8 +1,4 @@
-// ErrorBoundary (src/client/components/errorBoundary.tsx): real subtree
-// errors degrade to the styled error card; Retry resets the boundary.
-// React logs caught errors to console and replays the failed render through a
-// fake DOM event — silenced with a window-error preventer and a spy, never
-// mocked.
+// React logs caught errors and replays the failed render as a fake DOM error; silence both.
 
 import { createElement as h } from 'react'
 import assert from 'node:assert/strict'
@@ -57,7 +53,7 @@ describe('ErrorBoundary', () => {
   test('a non-Error throw is stringified into the card', async () => {
     silenceRenderErrors()
     function Bomb(): never {
-      throw 'string failure' // deliberate non-Error throw
+      throw 'string failure'
     }
     const m = await mount(h(ErrorBoundary, {}, h(Bomb, {})))
     assert.equal(query(m.container, '.lc-error-msg').textContent, 'string failure')
