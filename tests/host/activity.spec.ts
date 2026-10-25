@@ -641,7 +641,8 @@ describe('contextActivity unit: the schemas over the pricing record', () => {
     assert.notEqual(served.cost, persisted.cost)
     assert.notEqual(served.cost?.['deepseek-official'], persisted.cost?.['deepseek-official'])
     assert.notEqual(served.cost?.['deepseek-official']?.['deepseek-v4'], persisted.cost?.['deepseek-official']?.['deepseek-v4'])
-    assert.notEqual(served.cost?.['deepseek-official']?.['deepseek-v4']?.off, persisted.cost?.['deepseek-official']?.['deepseek-v4']?.off)
+    const period = isBeijingPeak(at(0)) ? 'peak' : 'off'
+    assert.notEqual(served.cost?.['deepseek-official']?.['deepseek-v4']?.[period], persisted.cost?.['deepseek-official']?.['deepseek-v4']?.[period])
     assert.notEqual(served.skills, persisted.skills)
     assert.notEqual(served.skills?.tdd, persisted.skills?.tdd)
     assert.deepEqual(served, persisted)

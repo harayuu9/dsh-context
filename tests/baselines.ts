@@ -2,7 +2,7 @@
 // and by the per-tag `compat` project that boots the BUILT plugin on real sources.
 
 /** Must stay in lockstep with the BASELINES entries below. */
-export type BaselineId = 'v0.2.0-rc.2' | 'v0.2.1-rc.2'
+export type BaselineId = 'v0.2.0-rc.2' | 'v0.2.1-rc.2' | 'v0.2.1-rc.3'
 
 export interface ClientSeam {
   imageFaceMethod: string
@@ -219,15 +219,15 @@ function baseline(id: BaselineId, tag: string, session: string, line: { cordis?:
       subagentAddress: {
         file: 'packages/api/session-controller/src/client/sessions/manager.ts',
         needle: 'subagentAddress',
-        summaryFallback: id === 'v0.2.1-rc.2',
+        summaryFallback: id !== 'v0.2.0-rc.2',
         summaryNeedle: 'summary?.origin',
       },
       pluginsNav: {
         file: 'packages/client/ui-plugin-manager/src/client/index.ts',
         needle: "'pluginNavigation', {",
-        tabReset: id === 'v0.2.1-rc.2',
+        tabReset: id !== 'v0.2.0-rc.2',
         tabResetNeedle: 'instance.actions.setTab',
-        tabsSlot: id === 'v0.2.1-rc.2',
+        tabsSlot: id !== 'v0.2.0-rc.2',
         tabsSlotFile: 'packages/client/ui-plugin-manager/src/client/slot-contract.ts',
         tabsSlotNeedle: "'plugins.tab'",
       },
@@ -309,6 +309,12 @@ export const BASELINES: readonly Baseline[] = [
   // The durable job events (`job/registered` / `job/settled`) exist only on this line — the command log degrades to
   // envelope-derived timing without them.
   baseline('v0.2.1-rc.2', 'dsh-v0.2.1-rc.2', '0.2.1-rc.2', {
+    cordis: '4.0.5',
+    stockIds: ['llm-deepseek', 'web-search-deepseek', 'web-deepseek-api'],
+    extraFoldEvents: ['job/registered', 'job/settled'],
+  }),
+  // Same cordis, stock entries and job events as 0.2.1-rc.2.
+  baseline('v0.2.1-rc.3', 'dsh-v0.2.1-rc.3', '0.2.1-rc.3', {
     cordis: '4.0.5',
     stockIds: ['llm-deepseek', 'web-search-deepseek', 'web-deepseek-api'],
     extraFoldEvents: ['job/registered', 'job/settled'],
